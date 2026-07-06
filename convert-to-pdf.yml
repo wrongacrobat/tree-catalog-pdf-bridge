@@ -1,0 +1,45 @@
+# Put this file at: .github/workflows/convert-to-pdf.yml in your repo
+#
+# Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
+# exported .pptx from your Apps Script Web App, converts it to PDF with
+# LibreOffice (this is what turns your alt text into real, tagged PDF
+# accessibility tags -- Google's own PDF export cannot do this), and posts
+# the finished PDF back to the same Web App to be saved into Drive.
+name: Convert Slides PPTX to Tagged PDF
+
+on:
+  workflow_dispatch:
+    inputs:
+      webapp_url:
+        description: 'Apps Script Web App URL'
+        required: true
+      secret:
+        description: 'Shared secret (matches BRIDGE_SECRET in Apps Script)'
+        required: true
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install LibreOffice and jq
+        run: sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq
+
+      - name: Download PPTX from Apps Script
+        run: |
+          curl -sS "${{ github.event.inputs.webapp_url }}?action=fetch_pptx&secret=${{ github.event.inputs.secret }}" -o pptx_b64.txt
+          base64 -d pptx_b64.txt > catalog.pptx
+          test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
+
+      - name: Convert to tagged PDF
+        run: |
+          soffice --headless --norestore --convert-to pdf catalog.pptx
+          test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
+
+      - name: Send PDF back to Apps Script
+        run: |
+          base64 -w0 catalog.pdf > pdf_b64.txt
+          jq -n --arg secret "${{ github.event.inputs.secret }}" --rawfile pdf pdf_b64.txt \
+            '{secret: $secret, pdf_base64: $pdf}' > payload.json
+          curl -sS -X POST "${{ github.event.inputs.webapp_url }}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
