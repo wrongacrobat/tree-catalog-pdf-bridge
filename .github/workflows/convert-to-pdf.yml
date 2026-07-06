@@ -26,8 +26,38 @@ jobs:
 
       - name: Download PPTX from Apps Script
         run: |
-          curl -sS "${{ github.event.inputs.webapp_url }}?action=fetch_pptx&secret=${{ github.event.inputs.secret }}" -o pptx_b64.txt
-          base64 -d pptx_b64.txt > catalog.pptx
+          HTTP_CODE=$(curl -sS -w "%{http_code}" "${{ github.event.inputs.webapp_url }}?action=fetch_pptx&secret=${{ github.event.inputs.secret }}" -o pptx_b64.txt)
+          echo "Web App responded with HTTP status: $HTTP_CODE"
+          echo "--- First 500 characters of the response (this is the actual diagnostic info) ---"
+          head -c 500 pptx_b64.txt
+          echo ""
+          echo "--- end preview ---"
+
+          if ! base64 -d pptx_b64.txt > catalog.pptx 2>/dev/null; then
+            echo ""
+            echo "############################################################"
+            echo "base64 decode FAILED. The response above is NOT valid base64"
+            echo "data -- it's whatever the Web App actually returned instead"
+            echo "of the expected pptx bytes. Read the preview above:"
+            echo "  - Starts with '<!DOCTYPE html' or '<html'  -> Apps Script"
+            echo "    returned an error page, not your doGet() text response."
+            echo "    Check Extensions > Apps Script > Executions in the sheet"
+            echo "    for what doGet actually did on this request."
+            echo "  - Says 'Forbidden'  -> the secret sent by this workflow run"
+            echo "    doesn't match BRIDGE_SECRET in Script Properties right"
+            echo "    now (it may have been regenerated since Step 5b ran)."
+            echo "  - Says 'No pending export'  -> PENDING_EXPORT_PPTX_ID was"
+            echo "    not set when this request arrived -- possibly Step 5b"
+            echo "    was run again (or cached data was cleared) after"
+            echo "    dispatching this workflow but before it reached this step."
+            echo "  - Says 'ERROR fetching pending export: ...' or 'ERROR:"
+            echo "    pending export file exists but is empty'  -> the message"
+            echo "    itself names the problem (e.g. file was deleted, or the"
+            echo "    pptx upload from step5b didn't fully complete)."
+            echo "############################################################"
+            exit 1
+          fi
+
           test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
 
       - name: Convert to tagged PDF
