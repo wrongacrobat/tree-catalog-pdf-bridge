@@ -26,7 +26,7 @@ jobs:
 
       - name: Download PPTX from Apps Script
         run: |
-          HTTP_CODE=$(curl -sS -w "%{http_code}" "${{ github.event.inputs.webapp_url }}?action=fetch_pptx&secret=${{ github.event.inputs.secret }}" -o pptx_b64.txt)
+          HTTP_CODE=$(curl -sSL -w "%{http_code}" "${{ github.event.inputs.webapp_url }}?action=fetch_pptx&secret=${{ github.event.inputs.secret }}" -o pptx_b64.txt)
           echo "Web App responded with HTTP status: $HTTP_CODE"
           echo "--- First 500 characters of the response (this is the actual diagnostic info) ---"
           head -c 500 pptx_b64.txt
@@ -70,6 +70,6 @@ jobs:
           base64 -w0 catalog.pdf > pdf_b64.txt
           jq -n --arg secret "${{ github.event.inputs.secret }}" --rawfile pdf pdf_b64.txt \
             '{secret: $secret, pdf_base64: $pdf}' > payload.json
-          curl -sS -X POST "${{ github.event.inputs.webapp_url }}" \
+          curl -sSL --post302 --post303 -X POST "${{ github.event.inputs.webapp_url }}" \
             -H "Content-Type: application/json" \
             -d @payload.json
