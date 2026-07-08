@@ -3,8 +3,10 @@
 # Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
 # exported .pptx from your Apps Script Web App, converts it to PDF with
 # LibreOffice (this is what turns your alt text into real, tagged PDF
-# accessibility tags -- Google's own PDF export cannot do this), and posts
-# the finished PDF back to the same Web App to be saved into Drive.
+# accessibility tags -- Google's own PDF export cannot do this), patches in
+# the PDF/UA metadata LibreOffice leaves out (title, XMP, PDF/UA identifier,
+# DisplayDocTitle), and posts the finished PDF back to the same Web App to
+# be saved into Drive.
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -21,8 +23,13 @@ jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
-      - name: Install LibreOffice and jq
-        run: sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install LibreOffice, jq, and pikepdf
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq python3-pip
+          pip install --break-system-packages pikepdf
 
       - name: Download PPTX from Apps Script
         run: |
@@ -62,8 +69,13 @@ jobs:
 
       - name: Convert to tagged PDF
         run: |
-          soffice --headless --norestore --convert-to pdf catalog.pptx
+          soffice --headless --norestore --convert-to \
+            'pdf:impress_pdf_Export:{"UseTaggedPDF":{"type":"boolean","value":true},"SelectPdfVersion":{"type":"long","value":17}}' \
+            catalog.pptx
           test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
+
+      - name: Fix PDF/UA metadata (title, XMP, PDF/UA id, DisplayDocTitle)
+        run: python3 fix_pdf_metadata.py catalog.pdf "Tree Catalog"
 
       - name: Send PDF back to Apps Script
         run: |
