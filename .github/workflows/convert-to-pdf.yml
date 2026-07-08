@@ -23,13 +23,55 @@ jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
       - name: Install LibreOffice, jq, and pikepdf
         run: |
           sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq python3-pip
           pip install --break-system-packages pikepdf
+
+      - name: Write PDF/UA metadata fix script
+        run: |
+          cat > fix_pdf_metadata.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """Fixes the PAC 'Metadata and Settings' errors LibreOffice leaves
+          behind: missing XMP metadata, missing PDF/UA identifier, missing
+          Title in XMP, and DisplayDocTitle not set."""
+          import sys
+          import pikepdf
+          from pikepdf import Name, Dictionary
+
+
+          def fix(path: str, title: str) -> None:
+              with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+                  with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                      meta["dc:title"] = title
+                      meta["pdfuaid:part"] = "1"
+
+                  pdf.docinfo["/Title"] = title
+
+                  root = pdf.Root
+                  if "/ViewerPreferences" not in root:
+                      root.ViewerPreferences = pdf.make_indirect(Dictionary())
+                  root.ViewerPreferences[Name("/DisplayDocTitle")] = True
+
+                  if "/MarkInfo" not in root:
+                      root.MarkInfo = pdf.make_indirect(Dictionary(Marked=True))
+                  elif "/Marked" not in root.MarkInfo:
+                      root.MarkInfo[Name("/Marked")] = True
+                  if "/Lang" not in root:
+                      root[Name("/Lang")] = pikepdf.String("en-US")
+
+                  pdf.save(path)
+              print(f"fix_pdf_metadata: wrote title, XMP, PDF/UA id, and viewer prefs to {path}")
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 2:
+                  sys.exit("usage: fix_pdf_metadata.py <file.pdf> [title]")
+              pdf_path = sys.argv[1]
+              doc_title = sys.argv[2] if len(sys.argv) > 2 else "Tree Catalog"
+              fix(pdf_path, doc_title)
+          PYEOF
+          echo "fix_pdf_metadata.py written, $(wc -l < fix_pdf_metadata.py) lines."
 
       - name: Download PPTX from Apps Script
         run: |
