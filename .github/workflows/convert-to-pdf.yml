@@ -2,15 +2,16 @@
 #
 # Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
 # exported .pptx from your Apps Script Web App, patches the PPTX (decorative
-# flags on unlabeled shapes, forced contrast fills behind white/black text,
-# whitespace-only paragraph cleanup), converts it to PDF with LibreOffice,
-# then post-processes the PDF for PDF/UA: wraps the untagged path objects
-# LibreOffice itself draws (slide backgrounds -- the one-per-page "Path
-# object not tagged" failure) as artifacts, wraps the DIV/Figure root
-# elements in a proper /Document root, promotes the first paragraph (cover
-# title) to /H1 so the document contains a heading, and writes the metadata
-# LibreOffice leaves out (title, XMP, PDF/UA identifier, DisplayDocTitle).
-# Finally posts the finished PDF back to the same Web App to save to Drive.
+# flags on unlabeled shapes, whitespace-only paragraph cleanup -- footer
+# contrast is handled directly in the Apps Script, not here), converts it to
+# PDF with LibreOffice, then post-processes the PDF for PDF/UA: wraps the
+# untagged path objects LibreOffice itself draws (slide backgrounds -- the
+# one-per-page "Path object not tagged" failure) as artifacts, wraps the
+# DIV/Figure root elements in a proper /Document root, promotes the first
+# paragraph (cover title) to /H1 so the document contains a heading, and
+# writes the metadata LibreOffice leaves out (title, XMP, PDF/UA identifier,
+# DisplayDocTitle). Finally posts the finished PDF back to the same Web App
+# to save to Drive.
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -44,18 +45,16 @@ jobs:
              non-empty descr is also set as a fallback. Fixes the 'Alternative
              text for Figure' failures and shape-level untagged paths.
 
-          B) Contrast forcing (slides only): any shape containing WHITE text gets
-             a forced solid #5C7D57 background fill; otherwise, any shape
-             containing BLACK text gets a forced #F6F6F6 fill. Explicit srgbClr
-             values are detected, plus theme colors tx1/dk1 (treated as black)
-             and bg1/lt1 (treated as white).
-
-          C) Whitespace cleanup (slides only): paragraphs whose runs are ALL
+          B) Whitespace cleanup (slides only): paragraphs whose runs are ALL
              whitespace get their text emptied (the paragraph/line break stays,
              so layout spacing is preserved). Whitespace runs BETWEEN real text
              runs are never touched. Fixes 'Tagged text consists only of
              whitespace' warnings that survive the Apps Script's shape-level
              cleanup.
+
+          NOTE: footer contrast (page number / date backing color) is handled in
+          the Apps Script itself, in addPageDecorations_ -- not here. This script
+          never forces a background fill on any shape.
           """
           import os
           import sys
@@ -69,16 +68,9 @@ jobs:
           DECOR_URI = '{C183D7F6-B498-43B3-948B-1728B52AA6E4}'
 
           NVPR = {'sp': 'nvSpPr', 'pic': 'nvPicPr', 'cxnSp': 'nvCxnSpPr'}
+          # Keep in sync with CONFIG.BLANK_ICON_ALT_TEXT in the Apps Script.
           BLANK_ALTS = {'blank spacer.', 'blank spacer'}
           FALLBACK_DESCR = 'Decorative graphic.'
-
-          BG_FOR_WHITE_TEXT = '5C7D57'
-          BG_FOR_BLACK_TEXT = 'F6F6F6'
-          WHITE_SCHEMES = {'bg1', 'lt1'}
-          BLACK_SCHEMES = {'tx1', 'dk1'}
-
-          FILL_TAGS = {'noFill', 'solidFill', 'gradFill', 'blipFill', 'pattFill', 'grpFill'}
-          AFTER_FILL_TAGS = {'ln', 'effectLst', 'effectDag', 'scene3d', 'sp3d', 'extLst'}
 
 
           def q(ns, tag):
@@ -106,75 +98,7 @@ jobs:
               return True
 
 
-          # ---------- B) contrast ----------
-
-          def run_color(rpr):
-              """Explicit color of one run-properties element, or None."""
-              if rpr is None:
-                  return None
-              fill = rpr.find(q(A, 'solidFill'))
-              if fill is None:
-                  return None
-              srgb = fill.find(q(A, 'srgbClr'))
-              if srgb is not None:
-                  return (srgb.get('val') or '').upper()
-              scheme = fill.find(q(A, 'schemeClr'))
-              if scheme is not None:
-                  v = scheme.get('val')
-                  if v in BLACK_SCHEMES:
-                      return '000000'
-                  if v in WHITE_SCHEMES:
-                      return 'FFFFFF'
-              return None
-
-
-          def text_colors(sp):
-              """Colors of every run in the shape that carries real text."""
-              colors = set()
-              for r in sp.iter(q(A, 'r')):
-                  t = r.find(q(A, 't'))
-                  if t is None or not (t.text and t.text.strip()):
-                      continue
-                  c = run_color(r.find(q(A, 'rPr')))
-                  if c is None:  # inherit from the paragraph's defRPr
-                      par = r.getparent()
-                      ppr = par.find(q(A, 'pPr')) if par is not None else None
-                      c = run_color(ppr.find(q(A, 'defRPr')) if ppr is not None else None)
-                  if c:
-                      colors.add(c)
-              return colors
-
-
-          def set_shape_fill(sp, hexval):
-              sppr = sp.find(q(P, 'spPr'))
-              if sppr is None:
-                  return False
-              for child in list(sppr):
-                  if not isinstance(child.tag, str):
-                      continue
-                  if etree.QName(child).localname in FILL_TAGS:
-                      sppr.remove(child)
-              fill = etree.Element(q(A, 'solidFill'))
-              etree.SubElement(fill, q(A, 'srgbClr'), {'val': hexval})
-              idx = len(sppr)
-              for i, child in enumerate(sppr):
-                  if isinstance(child.tag, str) and etree.QName(child).localname in AFTER_FILL_TAGS:
-                      idx = i
-                      break
-              sppr.insert(idx, fill)
-              return True
-
-
-          def force_contrast_fill(sp):
-              colors = text_colors(sp)
-              if 'FFFFFF' in colors:
-                  return set_shape_fill(sp, BG_FOR_WHITE_TEXT)
-              if '000000' in colors:
-                  return set_shape_fill(sp, BG_FOR_BLACK_TEXT)
-              return False
-
-
-          # ---------- C) whitespace paragraphs ----------
+          # ---------- B) whitespace paragraphs ----------
 
           def clear_whitespace_paragraphs(root):
               n = 0
@@ -197,7 +121,7 @@ jobs:
 
           def patch_part(data, is_slide):
               root = etree.fromstring(data)
-              decorated = filled = 0
+              decorated = 0
               for tag, nv in NVPR.items():
                   for el in root.iter(q(P, tag)):
                       nvpr = el.find(q(P, nv))
@@ -208,14 +132,14 @@ jobs:
                           continue
 
                       if tag == 'sp' and has_visible_text(el):
-                          if is_slide and force_contrast_fill(el):
-                              filled += 1
-                          continue  # real text content: tagged normally
+                          continue  # real text content: tagged normally, left alone
 
                       descr = (cnvpr.get('descr') or '').strip()
                       title = (cnvpr.get('title') or '').strip()
 
                       if descr.lower() in BLANK_ALTS:
+                          # Filler icon: artifact beats a "Blank spacer" Figure a
+                          # screen reader would otherwise have to announce.
                           if mark_decorative(cnvpr):
                               decorated += 1
                           continue
@@ -223,6 +147,7 @@ jobs:
                       if descr or title:
                           continue  # author-labeled: keep as a labeled Figure
 
+                      # Textless AND unlabeled: the PAC failure cases.
                       cnvpr.set('descr', FALLBACK_DESCR)
                       mark_decorative(cnvpr)
                       decorated += 1
@@ -231,13 +156,13 @@ jobs:
               return (
                   etree.tostring(root, xml_declaration=True, encoding='UTF-8',
                                  standalone=True),
-                  decorated, filled, ws,
+                  decorated, ws,
               )
 
 
           def main(path):
               tmp = path + '.tmp'
-              dec = fil = ws = parts = 0
+              dec = ws = parts = 0
               with zipfile.ZipFile(path) as zin, \
                    zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
                   for item in zin.infolist():
@@ -248,16 +173,16 @@ jobs:
                               name.startswith('ppt/slideLayouts/') or
                               name.startswith('ppt/slideMasters/')):
                           is_slide = name.startswith('ppt/slides/slide')
-                          data, d, f, w = patch_part(data, is_slide)
+                          data, d, w = patch_part(data, is_slide)
                           dec += d
-                          fil += f
                           ws += w
                           parts += 1
                       zout.writestr(item, data)
               os.replace(tmp, path)
               print('fix_pptx_accessibility: %d parts patched -- %d objects marked '
-                    'decorative, %d contrast fills forced, %d whitespace-only '
-                    'paragraphs emptied.' % (parts, dec, fil, ws))
+                    'decorative, %d whitespace-only paragraphs emptied. (Footer '
+                    'contrast is handled in Apps Script, not here.)'
+                    % (parts, dec, ws))
 
 
           if __name__ == '__main__':
@@ -492,7 +417,7 @@ jobs:
 
           test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
 
-      - name: Patch PPTX (decorative flags, contrast fills, whitespace cleanup)
+      - name: Patch PPTX (decorative flags, whitespace cleanup)
         run: python3 fix_pptx_accessibility.py catalog.pptx
 
       - name: Convert to tagged PDF
