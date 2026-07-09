@@ -1,12 +1,14 @@
 # Put this file at: .github/workflows/convert-to-pdf.yml in your repo
 #
 # Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
-# exported .pptx from your Apps Script Web App, converts it to PDF with
-# LibreOffice (this is what turns your alt text into real, tagged PDF
-# accessibility tags -- Google's own PDF export cannot do this), patches in
-# the PDF/UA metadata LibreOffice leaves out (title, XMP, PDF/UA identifier,
-# DisplayDocTitle), and posts the finished PDF back to the same Web App to
-# be saved into Drive.
+# exported .pptx from your Apps Script Web App, PATCHES THE PPTX so every
+# textless, unlabeled shape/picture/connector is marked "decorative" (the
+# adec:decorative OOXML flag -- LibreOffice 7.6+ exports these as real PDF
+# artifacts, which fixes both the "Path object not tagged" Content failures
+# and the "Alternative text for Figure" failures in PAC), converts it to PDF
+# with LibreOffice, patches in the PDF/UA metadata LibreOffice leaves out
+# (title, XMP, PDF/UA identifier, DisplayDocTitle), and posts the finished
+# PDF back to the same Web App to be saved into Drive.
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -23,10 +25,145 @@ jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
-      - name: Install LibreOffice, jq, and pikepdf
+      - name: Install LibreOffice, jq, pikepdf, and lxml
         run: |
           sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq python3-pip
-          pip install --break-system-packages pikepdf
+          pip install --break-system-packages pikepdf lxml
+
+      - name: Write PPTX accessibility patch script
+        run: |
+          cat > fix_pptx_accessibility.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """Patches a .pptx before LibreOffice conversion so no object can
+          come out the other side as an untagged path or an alt-less Figure.
+
+          For every shape (p:sp), picture (p:pic), and connector (p:cxnSp)
+          in the slides, layouts, and masters:
+            - If it contains visible text, it is left alone (LibreOffice
+              tags text content normally).
+            - If it has author-written alt text (descr/title), it is left
+              alone -- it becomes a properly labeled Figure.
+            - If its alt text is the pipeline's blank-spacer label, it is
+              marked DECORATIVE so it becomes a PDF artifact instead of a
+              Figure a screen reader has to announce.
+            - Otherwise (textless AND unlabeled -- the objects PAC flags as
+              "Path object not tagged" or "Figure without alternative
+              text"), it is marked DECORATIVE and also given a short
+              non-empty descr as a fallback in case artifact export is
+              unavailable.
+
+          The decorative flag is the adec:decorative OOXML extension.
+          LibreOffice 7.6+ (ubuntu-latest ships 24.x) imports it and, with
+          UseTaggedPDF, exports those objects as artifacts -- untagged
+          content that PDF/UA explicitly permits.
+          """
+          import os
+          import sys
+          import zipfile
+
+          from lxml import etree
+
+          P    = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+          A    = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+          ADEC = 'http://schemas.microsoft.com/office/drawing/2017/decorative'
+          DECOR_URI = '{C183D7F6-B498-43B3-948B-1728B52AA6E4}'
+
+          # element tag -> its non-visual properties wrapper
+          NVPR = {'sp': 'nvSpPr', 'pic': 'nvPicPr', 'cxnSp': 'nvCxnSpPr'}
+
+          # Alt text values that mean "this is filler" -- convert to artifact.
+          # Keep in sync with CONFIG.BLANK_ICON_ALT_TEXT in the Apps Script.
+          BLANK_ALTS = {'blank spacer.', 'blank spacer'}
+
+          FALLBACK_DESCR = 'Decorative graphic.'
+
+
+          def has_visible_text(el):
+              for t in el.iter('{%s}t' % A):
+                  if t.text and t.text.strip():
+                      return True
+              return False
+
+
+          def mark_decorative(cnvpr):
+              ext_lst = cnvpr.find('{%s}extLst' % A)
+              if ext_lst is None:
+                  ext_lst = etree.SubElement(cnvpr, '{%s}extLst' % A)
+              for e in ext_lst.findall('{%s}ext' % A):
+                  if e.get('uri') == DECOR_URI:
+                      return False  # already flagged
+              ext = etree.SubElement(ext_lst, '{%s}ext' % A, {'uri': DECOR_URI})
+              etree.SubElement(ext, '{%s}decorative' % ADEC, {'val': '1'})
+              return True
+
+
+          def patch_part(data):
+              root = etree.fromstring(data)
+              patched = 0
+              for tag, nv in NVPR.items():
+                  for el in root.iter('{%s}%s' % (P, tag)):
+                      nvpr = el.find('{%s}%s' % (P, nv))
+                      if nvpr is None:
+                          continue
+                      cnvpr = nvpr.find('{%s}cNvPr' % P)
+                      if cnvpr is None:
+                          continue
+
+                      if tag == 'sp' and has_visible_text(el):
+                          continue  # real text content: tagged normally
+
+                      descr = (cnvpr.get('descr') or '').strip()
+                      title = (cnvpr.get('title') or '').strip()
+
+                      if descr.lower() in BLANK_ALTS:
+                          # Filler icon: artifact beats a "Blank spacer" Figure.
+                          if mark_decorative(cnvpr):
+                              patched += 1
+                          continue
+
+                      if descr or title:
+                          continue  # author-labeled: keep as a labeled Figure
+
+                      # Textless AND unlabeled: the PAC failure cases.
+                      cnvpr.set('descr', FALLBACK_DESCR)
+                      mark_decorative(cnvpr)
+                      patched += 1
+              return (
+                  etree.tostring(root, xml_declaration=True,
+                                 encoding='UTF-8', standalone=True),
+                  patched,
+              )
+
+
+          def main(path):
+              tmp = path + '.tmp'
+              total = 0
+              parts = 0
+              with zipfile.ZipFile(path) as zin, \
+                   zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+                  for item in zin.infolist():
+                      data = zin.read(item.filename)
+                      name = item.filename
+                      if name.endswith('.xml') and (
+                              name.startswith('ppt/slides/slide') or
+                              name.startswith('ppt/slideLayouts/') or
+                              name.startswith('ppt/slideMasters/')):
+                          data, n = patch_part(data)
+                          total += n
+                          parts += 1
+                      zout.writestr(item, data)
+              os.replace(tmp, path)
+              print('fix_pptx_accessibility: patched %d objects across %d '
+                    'slide/layout/master parts (marked decorative, fallback '
+                    'alt text added).' % (total, parts))
+
+
+          if __name__ == '__main__':
+              if len(sys.argv) < 2:
+                  sys.exit('usage: fix_pptx_accessibility.py <file.pptx>')
+              main(sys.argv[1])
+          PYEOF
+          echo "fix_pptx_accessibility.py written, $(wc -l < fix_pptx_accessibility.py) lines."
 
       - name: Write PDF/UA metadata fix script
         run: |
@@ -108,6 +245,9 @@ jobs:
           fi
 
           test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
+
+      - name: Mark unlabeled shapes decorative (fixes path tagging + alt text)
+        run: python3 fix_pptx_accessibility.py catalog.pptx
 
       - name: Convert to tagged PDF
         run: |
