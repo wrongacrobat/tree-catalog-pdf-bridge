@@ -1,14 +1,16 @@
 # Put this file at: .github/workflows/convert-to-pdf.yml in your repo
 #
 # Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
-# exported .pptx from your Apps Script Web App, PATCHES THE PPTX so every
-# textless, unlabeled shape/picture/connector is marked "decorative" (the
-# adec:decorative OOXML flag -- LibreOffice 7.6+ exports these as real PDF
-# artifacts, which fixes both the "Path object not tagged" Content failures
-# and the "Alternative text for Figure" failures in PAC), converts it to PDF
-# with LibreOffice, patches in the PDF/UA metadata LibreOffice leaves out
-# (title, XMP, PDF/UA identifier, DisplayDocTitle), and posts the finished
-# PDF back to the same Web App to be saved into Drive.
+# exported .pptx from your Apps Script Web App, patches the PPTX (decorative
+# flags on unlabeled shapes, forced contrast fills behind white/black text,
+# whitespace-only paragraph cleanup), converts it to PDF with LibreOffice,
+# then post-processes the PDF for PDF/UA: wraps the untagged path objects
+# LibreOffice itself draws (slide backgrounds -- the one-per-page "Path
+# object not tagged" failure) as artifacts, wraps the DIV/Figure root
+# elements in a proper /Document root, promotes the first paragraph (cover
+# title) to /H1 so the document contains a heading, and writes the metadata
+# LibreOffice leaves out (title, XMP, PDF/UA identifier, DisplayDocTitle).
+# Finally posts the finished PDF back to the same Web App to save to Drive.
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -34,28 +36,26 @@ jobs:
         run: |
           cat > fix_pptx_accessibility.py << 'PYEOF'
           #!/usr/bin/env python3
-          """Patches a .pptx before LibreOffice conversion so no object can
-          come out the other side as an untagged path or an alt-less Figure.
+          """Patches a .pptx before LibreOffice conversion.
 
-          For every shape (p:sp), picture (p:pic), and connector (p:cxnSp)
-          in the slides, layouts, and masters:
-            - If it contains visible text, it is left alone (LibreOffice
-              tags text content normally).
-            - If it has author-written alt text (descr/title), it is left
-              alone -- it becomes a properly labeled Figure.
-            - If its alt text is the pipeline's blank-spacer label, it is
-              marked DECORATIVE so it becomes a PDF artifact instead of a
-              Figure a screen reader has to announce.
-            - Otherwise (textless AND unlabeled -- the objects PAC flags as
-              "Path object not tagged" or "Figure without alternative
-              text"), it is marked DECORATIVE and also given a short
-              non-empty descr as a fallback in case artifact export is
-              unavailable.
+          A) Decorative flags: every textless, unlabeled shape/picture/connector
+             (and every "Blank spacer." filler icon) gets the adec:decorative
+             OOXML flag, which LibreOffice 7.6+ exports as a PDF artifact. A short
+             non-empty descr is also set as a fallback. Fixes the 'Alternative
+             text for Figure' failures and shape-level untagged paths.
 
-          The decorative flag is the adec:decorative OOXML extension.
-          LibreOffice 7.6+ (ubuntu-latest ships 24.x) imports it and, with
-          UseTaggedPDF, exports those objects as artifacts -- untagged
-          content that PDF/UA explicitly permits.
+          B) Contrast forcing (slides only): any shape containing WHITE text gets
+             a forced solid #5C7D57 background fill; otherwise, any shape
+             containing BLACK text gets a forced #F6F6F6 fill. Explicit srgbClr
+             values are detected, plus theme colors tx1/dk1 (treated as black)
+             and bg1/lt1 (treated as white).
+
+          C) Whitespace cleanup (slides only): paragraphs whose runs are ALL
+             whitespace get their text emptied (the paragraph/line break stays,
+             so layout spacing is preserved). Whitespace runs BETWEEN real text
+             runs are never touched. Fixes 'Tagged text consists only of
+             whitespace' warnings that survive the Apps Script's shape-level
+             cleanup.
           """
           import os
           import sys
@@ -68,77 +68,176 @@ jobs:
           ADEC = 'http://schemas.microsoft.com/office/drawing/2017/decorative'
           DECOR_URI = '{C183D7F6-B498-43B3-948B-1728B52AA6E4}'
 
-          # element tag -> its non-visual properties wrapper
           NVPR = {'sp': 'nvSpPr', 'pic': 'nvPicPr', 'cxnSp': 'nvCxnSpPr'}
-
-          # Alt text values that mean "this is filler" -- convert to artifact.
-          # Keep in sync with CONFIG.BLANK_ICON_ALT_TEXT in the Apps Script.
           BLANK_ALTS = {'blank spacer.', 'blank spacer'}
-
           FALLBACK_DESCR = 'Decorative graphic.'
+
+          BG_FOR_WHITE_TEXT = '5C7D57'
+          BG_FOR_BLACK_TEXT = 'F6F6F6'
+          WHITE_SCHEMES = {'bg1', 'lt1'}
+          BLACK_SCHEMES = {'tx1', 'dk1'}
+
+          FILL_TAGS = {'noFill', 'solidFill', 'gradFill', 'blipFill', 'pattFill', 'grpFill'}
+          AFTER_FILL_TAGS = {'ln', 'effectLst', 'effectDag', 'scene3d', 'sp3d', 'extLst'}
+
+
+          def q(ns, tag):
+              return '{%s}%s' % (ns, tag)
 
 
           def has_visible_text(el):
-              for t in el.iter('{%s}t' % A):
+              for t in el.iter(q(A, 't')):
                   if t.text and t.text.strip():
                       return True
               return False
 
 
+          # ---------- A) decorative ----------
+
           def mark_decorative(cnvpr):
-              ext_lst = cnvpr.find('{%s}extLst' % A)
+              ext_lst = cnvpr.find(q(A, 'extLst'))
               if ext_lst is None:
-                  ext_lst = etree.SubElement(cnvpr, '{%s}extLst' % A)
-              for e in ext_lst.findall('{%s}ext' % A):
+                  ext_lst = etree.SubElement(cnvpr, q(A, 'extLst'))
+              for e in ext_lst.findall(q(A, 'ext')):
                   if e.get('uri') == DECOR_URI:
-                      return False  # already flagged
-              ext = etree.SubElement(ext_lst, '{%s}ext' % A, {'uri': DECOR_URI})
-              etree.SubElement(ext, '{%s}decorative' % ADEC, {'val': '1'})
+                      return False
+              ext = etree.SubElement(ext_lst, q(A, 'ext'), {'uri': DECOR_URI})
+              etree.SubElement(ext, q(ADEC, 'decorative'), {'val': '1'})
               return True
 
 
-          def patch_part(data):
+          # ---------- B) contrast ----------
+
+          def run_color(rpr):
+              """Explicit color of one run-properties element, or None."""
+              if rpr is None:
+                  return None
+              fill = rpr.find(q(A, 'solidFill'))
+              if fill is None:
+                  return None
+              srgb = fill.find(q(A, 'srgbClr'))
+              if srgb is not None:
+                  return (srgb.get('val') or '').upper()
+              scheme = fill.find(q(A, 'schemeClr'))
+              if scheme is not None:
+                  v = scheme.get('val')
+                  if v in BLACK_SCHEMES:
+                      return '000000'
+                  if v in WHITE_SCHEMES:
+                      return 'FFFFFF'
+              return None
+
+
+          def text_colors(sp):
+              """Colors of every run in the shape that carries real text."""
+              colors = set()
+              for r in sp.iter(q(A, 'r')):
+                  t = r.find(q(A, 't'))
+                  if t is None or not (t.text and t.text.strip()):
+                      continue
+                  c = run_color(r.find(q(A, 'rPr')))
+                  if c is None:  # inherit from the paragraph's defRPr
+                      par = r.getparent()
+                      ppr = par.find(q(A, 'pPr')) if par is not None else None
+                      c = run_color(ppr.find(q(A, 'defRPr')) if ppr is not None else None)
+                  if c:
+                      colors.add(c)
+              return colors
+
+
+          def set_shape_fill(sp, hexval):
+              sppr = sp.find(q(P, 'spPr'))
+              if sppr is None:
+                  return False
+              for child in list(sppr):
+                  if not isinstance(child.tag, str):
+                      continue
+                  if etree.QName(child).localname in FILL_TAGS:
+                      sppr.remove(child)
+              fill = etree.Element(q(A, 'solidFill'))
+              etree.SubElement(fill, q(A, 'srgbClr'), {'val': hexval})
+              idx = len(sppr)
+              for i, child in enumerate(sppr):
+                  if isinstance(child.tag, str) and etree.QName(child).localname in AFTER_FILL_TAGS:
+                      idx = i
+                      break
+              sppr.insert(idx, fill)
+              return True
+
+
+          def force_contrast_fill(sp):
+              colors = text_colors(sp)
+              if 'FFFFFF' in colors:
+                  return set_shape_fill(sp, BG_FOR_WHITE_TEXT)
+              if '000000' in colors:
+                  return set_shape_fill(sp, BG_FOR_BLACK_TEXT)
+              return False
+
+
+          # ---------- C) whitespace paragraphs ----------
+
+          def clear_whitespace_paragraphs(root):
+              n = 0
+              for par in root.iter(q(A, 'p')):
+                  ts = par.findall('.//' + q(A, 't'))
+                  if not ts:
+                      continue
+                  texts = [t.text or '' for t in ts]
+                  if any(x.strip() for x in texts):
+                      continue  # paragraph has real text: leave every run alone
+                  if not any(texts):
+                      continue  # already empty
+                  for t in ts:
+                      t.text = ''
+                  n += 1
+              return n
+
+
+          # ---------- driver ----------
+
+          def patch_part(data, is_slide):
               root = etree.fromstring(data)
-              patched = 0
+              decorated = filled = 0
               for tag, nv in NVPR.items():
-                  for el in root.iter('{%s}%s' % (P, tag)):
-                      nvpr = el.find('{%s}%s' % (P, nv))
+                  for el in root.iter(q(P, tag)):
+                      nvpr = el.find(q(P, nv))
                       if nvpr is None:
                           continue
-                      cnvpr = nvpr.find('{%s}cNvPr' % P)
+                      cnvpr = nvpr.find(q(P, 'cNvPr'))
                       if cnvpr is None:
                           continue
 
                       if tag == 'sp' and has_visible_text(el):
+                          if is_slide and force_contrast_fill(el):
+                              filled += 1
                           continue  # real text content: tagged normally
 
                       descr = (cnvpr.get('descr') or '').strip()
                       title = (cnvpr.get('title') or '').strip()
 
                       if descr.lower() in BLANK_ALTS:
-                          # Filler icon: artifact beats a "Blank spacer" Figure.
                           if mark_decorative(cnvpr):
-                              patched += 1
+                              decorated += 1
                           continue
 
                       if descr or title:
                           continue  # author-labeled: keep as a labeled Figure
 
-                      # Textless AND unlabeled: the PAC failure cases.
                       cnvpr.set('descr', FALLBACK_DESCR)
                       mark_decorative(cnvpr)
-                      patched += 1
+                      decorated += 1
+
+              ws = clear_whitespace_paragraphs(root) if is_slide else 0
               return (
-                  etree.tostring(root, xml_declaration=True,
-                                 encoding='UTF-8', standalone=True),
-                  patched,
+                  etree.tostring(root, xml_declaration=True, encoding='UTF-8',
+                                 standalone=True),
+                  decorated, filled, ws,
               )
 
 
           def main(path):
               tmp = path + '.tmp'
-              total = 0
-              parts = 0
+              dec = fil = ws = parts = 0
               with zipfile.ZipFile(path) as zin, \
                    zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
                   for item in zin.infolist():
@@ -148,14 +247,17 @@ jobs:
                               name.startswith('ppt/slides/slide') or
                               name.startswith('ppt/slideLayouts/') or
                               name.startswith('ppt/slideMasters/')):
-                          data, n = patch_part(data)
-                          total += n
+                          is_slide = name.startswith('ppt/slides/slide')
+                          data, d, f, w = patch_part(data, is_slide)
+                          dec += d
+                          fil += f
+                          ws += w
                           parts += 1
                       zout.writestr(item, data)
               os.replace(tmp, path)
-              print('fix_pptx_accessibility: patched %d objects across %d '
-                    'slide/layout/master parts (marked decorative, fallback '
-                    'alt text added).' % (total, parts))
+              print('fix_pptx_accessibility: %d parts patched -- %d objects marked '
+                    'decorative, %d contrast fills forced, %d whitespace-only '
+                    'paragraphs emptied.' % (parts, dec, fil, ws))
 
 
           if __name__ == '__main__':
@@ -165,50 +267,194 @@ jobs:
           PYEOF
           echo "fix_pptx_accessibility.py written, $(wc -l < fix_pptx_accessibility.py) lines."
 
-      - name: Write PDF/UA metadata fix script
+      - name: Write PDF/UA post-processing script
         run: |
-          cat > fix_pdf_metadata.py << 'PYEOF'
+          cat > fix_pdf_pdfua.py << 'PYEOF'
           #!/usr/bin/env python3
-          """Fixes the PAC 'Metadata and Settings' errors LibreOffice leaves
-          behind: missing XMP metadata, missing PDF/UA identifier, missing
-          Title in XMP, and DisplayDocTitle not set."""
+          """Post-processes the LibreOffice tagged PDF into PDF/UA shape.
+
+          1. Wraps every untagged path drawing (LibreOffice draws the slide
+             background itself, outside any tag -- the per-page 'Path object not
+             tagged' failure) in /Artifact BMC ... EMC.
+          2. Ensures the structure tree root child is a single /Document element
+             (fixes 'DIV/Figure structure element used as root element').
+          3. Promotes the first paragraph in reading order (the cover title) to
+             /H1 if the document has no headings at all.
+          4. Writes the metadata LibreOffice leaves out: XMP title, PDF/UA
+             identifier, DisplayDocTitle, MarkInfo, Lang.
+          """
           import sys
+
           import pikepdf
-          from pikepdf import Name, Dictionary
+          from pikepdf import Dictionary, Name, Operator
+
+          CSI = pikepdf.ContentStreamInstruction
+
+          PATH_OPS = {'m', 'l', 'c', 'v', 'y', 're', 'h', 'W', 'W*'}
+          PAINT_OPS = {'S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n'}
+          STANDALONE_PAINT_OPS = {'sh'}
+          HEADING_TAGS = {'/H', '/H1', '/H2', '/H3', '/H4', '/H5', '/H6'}
 
 
-          def fix(path: str, title: str) -> None:
+          # ---------- 1. artifact untagged path objects ----------
+
+          def artifact_untagged_paths(pdf):
+              wrapped = 0
+              for page in pdf.pages:
+                  try:
+                      instructions = pikepdf.parse_content_stream(page)
+                  except Exception as exc:  # malformed page: leave untouched
+                      print('  skipping one page (unparseable content stream): %s' % exc)
+                      continue
+                  out = []
+                  depth = 0          # marked-content nesting depth
+                  pathbuf = []       # buffered untagged path-construction ops
+                  changed = False
+                  for inst in instructions:
+                      op = str(getattr(inst, 'operator', ''))
+                      if pathbuf:
+                          if op in PATH_OPS:
+                              pathbuf.append(inst)
+                              continue
+                          if op in PAINT_OPS:
+                              out.append(CSI([Name('/Artifact')], Operator('BMC')))
+                              out.extend(pathbuf)
+                              out.append(inst)
+                              out.append(CSI([], Operator('EMC')))
+                              pathbuf = []
+                              changed = True
+                              wrapped += 1
+                              continue
+                          # unexpected operator mid-path: flush the buffer unwrapped
+                          out.extend(pathbuf)
+                          pathbuf = []
+                      if op in ('BDC', 'BMC'):
+                          depth += 1
+                      elif op == 'EMC':
+                          depth = max(0, depth - 1)
+                      elif depth == 0 and op in PATH_OPS:
+                          pathbuf = [inst]
+                          continue
+                      elif depth == 0 and op in STANDALONE_PAINT_OPS:
+                          out.append(CSI([Name('/Artifact')], Operator('BMC')))
+                          out.append(inst)
+                          out.append(CSI([], Operator('EMC')))
+                          changed = True
+                          wrapped += 1
+                          continue
+                      out.append(inst)
+                  if pathbuf:
+                      out.extend(pathbuf)
+                  if changed:
+                      page.Contents = pdf.make_indirect(
+                          pikepdf.Stream(pdf, pikepdf.unparse_content_stream(out)))
+              return wrapped
+
+
+          # ---------- 2 & 3. structure tree fixes ----------
+
+          def struct_children(node):
+              k = node.get('/K')
+              if k is None:
+                  return []
+              if isinstance(k, pikepdf.Array):
+                  return list(k)
+              return [k]
+
+
+          def iter_struct_elems(roots):
+              """Preorder walk over structure elements (dicts with /S)."""
+              stack = list(reversed(roots))
+              while stack:
+                  el = stack.pop()
+                  if not isinstance(el, pikepdf.Dictionary):
+                      continue  # MCID integers
+                  if '/S' in el:
+                      yield el
+                  stack.extend(reversed(struct_children(el)))
+
+
+          def fix_structure_root(pdf):
+              root = pdf.Root
+              st = root.get('/StructTreeRoot')
+              if st is None:
+                  return 'no structure tree present, nothing to fix'
+              kids = struct_children(st)
+              kids = [k for k in kids if isinstance(k, pikepdf.Dictionary)]
+              if not kids:
+                  return 'structure tree has no element children'
+              if len(kids) == 1:
+                  s = str(kids[0].get('/S', ''))
+                  if s == '/Document':
+                      return 'root element is already /Document'
+                  kids[0][Name('/S')] = Name('/Document')
+                  return 'retyped single root element %s -> /Document' % s
+              doc = pdf.make_indirect(Dictionary(
+                  Type=Name('/StructElem'),
+                  S=Name('/Document'),
+                  P=st,
+                  K=pikepdf.Array(kids),
+              ))
+              for k in kids:
+                  try:
+                      k[Name('/P')] = doc
+                  except Exception:
+                      pass
+              st[Name('/K')] = doc
+              return 'wrapped %d root elements in a new /Document' % len(kids)
+
+
+          def ensure_heading(pdf):
+              st = pdf.Root.get('/StructTreeRoot')
+              if st is None:
+                  return 'no structure tree, cannot add a heading'
+              roots = [k for k in struct_children(st) if isinstance(k, pikepdf.Dictionary)]
+              for el in iter_struct_elems(roots):
+                  if str(el.get('/S', '')) in HEADING_TAGS:
+                      return 'document already contains headings'
+              for el in iter_struct_elems(roots):
+                  if str(el.get('/S', '')) == '/P':
+                      el[Name('/S')] = Name('/H1')
+                      return 'promoted first paragraph in reading order to /H1'
+              return 'no /P element found to promote'
+
+
+          # ---------- 4. metadata ----------
+
+          def fix_metadata(pdf, title):
+              with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                  meta['dc:title'] = title
+                  meta['pdfuaid:part'] = '1'
+              pdf.docinfo['/Title'] = title
+              root = pdf.Root
+              if '/ViewerPreferences' not in root:
+                  root.ViewerPreferences = pdf.make_indirect(Dictionary())
+              root.ViewerPreferences[Name('/DisplayDocTitle')] = True
+              if '/MarkInfo' not in root:
+                  root.MarkInfo = pdf.make_indirect(Dictionary(Marked=True))
+              elif '/Marked' not in root.MarkInfo:
+                  root.MarkInfo[Name('/Marked')] = True
+              if '/Lang' not in root:
+                  root[Name('/Lang')] = pikepdf.String('en-US')
+
+
+          def main(path, title):
               with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-                  with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
-                      meta["dc:title"] = title
-                      meta["pdfuaid:part"] = "1"
-
-                  pdf.docinfo["/Title"] = title
-
-                  root = pdf.Root
-                  if "/ViewerPreferences" not in root:
-                      root.ViewerPreferences = pdf.make_indirect(Dictionary())
-                  root.ViewerPreferences[Name("/DisplayDocTitle")] = True
-
-                  if "/MarkInfo" not in root:
-                      root.MarkInfo = pdf.make_indirect(Dictionary(Marked=True))
-                  elif "/Marked" not in root.MarkInfo:
-                      root.MarkInfo[Name("/Marked")] = True
-                  if "/Lang" not in root:
-                      root[Name("/Lang")] = pikepdf.String("en-US")
-
+                  n = artifact_untagged_paths(pdf)
+                  print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
+                  print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
+                  print('fix_pdf_pdfua: headings: %s.' % ensure_heading(pdf))
+                  fix_metadata(pdf, title)
                   pdf.save(path)
-              print(f"fix_pdf_metadata: wrote title, XMP, PDF/UA id, and viewer prefs to {path}")
+              print('fix_pdf_pdfua: wrote title, XMP, PDF/UA id, and viewer prefs to %s' % path)
 
 
-          if __name__ == "__main__":
+          if __name__ == '__main__':
               if len(sys.argv) < 2:
-                  sys.exit("usage: fix_pdf_metadata.py <file.pdf> [title]")
-              pdf_path = sys.argv[1]
-              doc_title = sys.argv[2] if len(sys.argv) > 2 else "Tree Catalog"
-              fix(pdf_path, doc_title)
+                  sys.exit('usage: fix_pdf_pdfua.py <file.pdf> [title]')
+              main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'Tree Catalog')
           PYEOF
-          echo "fix_pdf_metadata.py written, $(wc -l < fix_pdf_metadata.py) lines."
+          echo "fix_pdf_pdfua.py written, $(wc -l < fix_pdf_pdfua.py) lines."
 
       - name: Download PPTX from Apps Script
         run: |
@@ -246,7 +492,7 @@ jobs:
 
           test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
 
-      - name: Mark unlabeled shapes decorative (fixes path tagging + alt text)
+      - name: Patch PPTX (decorative flags, contrast fills, whitespace cleanup)
         run: python3 fix_pptx_accessibility.py catalog.pptx
 
       - name: Convert to tagged PDF
@@ -256,8 +502,8 @@ jobs:
             catalog.pptx
           test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
 
-      - name: Fix PDF/UA metadata (title, XMP, PDF/UA id, DisplayDocTitle)
-        run: python3 fix_pdf_metadata.py catalog.pdf "Tree Catalog"
+      - name: Post-process PDF for PDF/UA (artifacts, structure root, H1, metadata)
+        run: python3 fix_pdf_pdfua.py catalog.pdf "Tree Catalog"
 
       - name: Send PDF back to Apps Script
         run: |
