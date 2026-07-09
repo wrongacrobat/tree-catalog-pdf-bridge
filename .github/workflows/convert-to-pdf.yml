@@ -5,8 +5,11 @@
 # flags on unlabeled shapes, whitespace-only paragraph cleanup -- footer
 # contrast is handled directly in the Apps Script, not here), converts it to
 # PDF with LibreOffice, then post-processes the PDF for PDF/UA:
-#   - retags whitespace-only leaf marked-content spans as artifacts (fixes
-#     "tagged text consists only of whitespace")
+#   - retags whitespace-only leaf marked-content spans as artifacts, using
+#     each font's /ToUnicode CMap to correctly decode text (LibreOffice's
+#     Tj/TJ bytes are raw glyph indices into the embedded subset font, NOT
+#     character codes -- comparing them to a literal space never matches,
+#     which is why this needs real font-aware decoding to work at all)
 #   - wraps every untagged path object LibreOffice draws itself (slide
 #     backgrounds) as an artifact (fixes "path object not tagged", one per
 #     page)
@@ -18,12 +21,6 @@
 #   - writes the metadata LibreOffice leaves out (title, XMP, PDF/UA
 #     identifier, DisplayDocTitle)
 # Finally posts the finished PDF back to the same Web App to save to Drive.
-#
-# Speed: apt-get uses --no-install-recommends (skips LibreOffice components
-# this pipeline never uses -- Writer, Calc, Base, full language packs -- so
-# the "Install LibreOffice" step installs meaningfully less and finishes
-# faster on every single run, since GitHub Actions runners start clean each
-# time and nothing here is cached between runs).
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -221,6 +218,7 @@ jobs:
           4. Writes the metadata LibreOffice leaves out: XMP title, PDF/UA
              identifier, DisplayDocTitle, MarkInfo, Lang.
           """
+          import re
           import sys
 
           import pikepdf
@@ -234,6 +232,96 @@ jobs:
           HEADING_TAGS = {'/H', '/H1', '/H2', '/H3', '/H4', '/H5', '/H6'}
           TEXT_SHOW_OPS = {'Tj', "'", '"'}
           WHITESPACE_CHARS = set(' \t\r\n\x0b\x0c\xa0')
+
+
+          # ---------- font decoding ----------
+          #
+          # Tj/TJ operands in a LibreOffice-exported PDF are raw GLYPH INDICES into
+          # the embedded subset font (e.g. b'\x01' for whatever glyph happens to be
+          # first in that subset) -- NOT character codes. Comparing those bytes
+          # directly against ' ' never matches, even for an actual space glyph, so
+          # any whitespace-detection that skips this step silently finds nothing.
+          # The font's /ToUnicode CMap is what maps glyph code -> real Unicode text;
+          # every font LibreOffice embeds carries one.
+          def parse_tounicode_cmap(data):
+              text = data.decode('latin-1', errors='replace')
+              width = 1
+              m = re.search(r'begincodespacerange(.*?)endcodespacerange', text, re.S)
+              if m:
+                  hexes = re.findall(r'<([0-9A-Fa-f]+)>', m.group(1))
+                  if hexes:
+                      width = max(1, len(hexes[0]) // 2)
+              mapping = {}
+              for m in re.finditer(r'beginbfchar(.*?)endbfchar', text, re.S):
+                  for src, dst in re.findall(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', m.group(1)):
+                      try:
+                          mapping[int(src, 16)] = bytes.fromhex(dst).decode('utf-16-be')
+                      except Exception:
+                          pass
+              for m in re.finditer(r'beginbfrange(.*?)endbfrange', text, re.S):
+                  for rm in re.finditer(
+                          r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]+>|\[[^\]]*\])',
+                          m.group(1)):
+                      lo, hi, dst = rm.group(1), rm.group(2), rm.group(3)
+                      lo_i, hi_i = int(lo, 16), int(hi, 16)
+                      if dst.startswith('['):
+                          dsts = re.findall(r'<([0-9A-Fa-f]+)>', dst)
+                          for i, code in enumerate(range(lo_i, hi_i + 1)):
+                              if i < len(dsts):
+                                  try:
+                                      mapping[code] = bytes.fromhex(dsts[i]).decode('utf-16-be')
+                                  except Exception:
+                                      pass
+                      else:
+                          dst_hex = dst.strip('<>')
+                          base = int(dst_hex, 16)
+                          nbytes = max(2, (len(dst_hex) + 1) // 2)
+                          for i, code in enumerate(range(lo_i, hi_i + 1)):
+                              try:
+                                  mapping[code] = (base + i).to_bytes(
+                                      nbytes, 'big').decode('utf-16-be', errors='ignore')
+                              except Exception:
+                                  pass
+              return width, mapping
+
+
+          def build_font_decoders(page):
+              """{font_resource_name (e.g. '/F1'): (byte_width, {code: unicode})}
+              for every font on this page we can safely decode:
+                - if it carries a /ToUnicode CMap, use that (always correct, and
+                  the only correct option for LibreOffice's embedded subset fonts,
+                  whose Tj/TJ bytes are glyph indices, not character codes)
+                - otherwise, if it's a SIMPLE (single-byte, non-composite) font,
+                  its raw codes are WinAnsi-ish character codes directly, so a
+                  byte value = codepoint fallback is safe (this is what covers
+                  plain base-14 fonts with no embedded ToUnicode)
+                - a composite font with no ToUnicode is left out entirely: its
+                  text is treated as unknown and never guessed at as whitespace
+              """
+              decoders = {}
+              try:
+                  fonts = page.obj.get('/Resources', {}).get('/Font', {})
+              except Exception:
+                  return decoders
+              for name, font in fonts.items():
+                  try:
+                      if '/ToUnicode' in font:
+                          decoders[name] = parse_tounicode_cmap(font.ToUnicode.read_bytes())
+                          continue
+                      subtype = str(font.get('/Subtype', ''))
+                      if subtype in ('/Type1', '/TrueType', '/MMType1', '/Type3'):
+                          decoders[name] = (1, {c: chr(c) for c in range(256)})
+                  except Exception:
+                      continue
+              return decoders
+
+
+          def decode_pdf_string(raw, width, mapping):
+              out = []
+              for i in range(0, len(raw) - width + 1, width):
+                  code = int.from_bytes(raw[i:i + width], 'big')
+                  out.append(mapping.get(code, '\ufffd'))  # unknown glyph: not whitespace
+              return ''.join(out)
 
 
           # ---------- 0. whitespace-only leaf marked-content spans ----------
@@ -256,14 +344,22 @@ jobs:
                   except Exception as exc:
                       print('  skipping one page (unparseable content stream): %s' % exc)
                       continue
+                  font_decoders = build_font_decoders(page)
+                  cur_font = None
                   n = len(instructions)
                   stack = []   # each: {'start': idx, 'texts': [], 'nested': False}
                   convert = {}  # start_idx -> True (retag), populated as spans close
                   page_changed = False
 
                   for idx in range(n):
-                      op = str(getattr(instructions[idx], 'operator', ''))
-                      if op in ('BDC', 'BMC'):
+                      inst = instructions[idx]
+                      op = str(getattr(inst, 'operator', ''))
+                      if op == 'Tf':
+                          try:
+                              cur_font = str(inst.operands[0])
+                          except Exception:
+                              cur_font = None
+                      elif op in ('BDC', 'BMC'):
                           if stack:
                               stack[-1]['nested'] = True
                           stack.append({'start': idx, 'texts': [], 'nested': False})
@@ -273,23 +369,29 @@ jobs:
                           span = stack.pop()
                           if not span['nested']:
                               text = ''.join(span['texts'])
-                              if text and all(c in WHITESPACE_CHARS for c in text):
+                              if text and '\ufffd' not in text and \
+                                      all(c in WHITESPACE_CHARS for c in text):
                                   convert[span['start']] = True
-                          if stack:
-                              # a whitespace leaf inside a real parent doesn't make
-                              # the parent whitespace-only; texts don't propagate up
-                              pass
                       elif op in TEXT_SHOW_OPS and stack:
-                          try:
-                              s = instructions[idx].operands[-1]
-                              stack[-1]['texts'].append(str(s))
-                          except Exception:
-                              pass
+                          width, mapping = font_decoders.get(cur_font, (0, None))
+                          if mapping is not None:
+                              try:
+                                  stack[-1]['texts'].append(
+                                      decode_pdf_string(bytes(inst.operands[-1]), width, mapping))
+                              except Exception:
+                                  stack[-1]['texts'].append('\ufffd')
+                          else:
+                              stack[-1]['texts'].append('\ufffd')  # unknown font: don't guess
                       elif op == 'TJ' and stack:
+                          width, mapping = font_decoders.get(cur_font, (0, None))
                           try:
-                              for el in instructions[idx].operands[0]:
-                                  if isinstance(el, (pikepdf.String, str, bytes)):
-                                      stack[-1]['texts'].append(str(el))
+                              for el in inst.operands[0]:
+                                  if isinstance(el, pikepdf.String):
+                                      if mapping is not None:
+                                          stack[-1]['texts'].append(
+                                              decode_pdf_string(bytes(el), width, mapping))
+                                      else:
+                                          stack[-1]['texts'].append('\ufffd')
                           except Exception:
                               pass
 
