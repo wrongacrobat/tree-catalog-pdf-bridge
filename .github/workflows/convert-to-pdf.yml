@@ -4,14 +4,26 @@
 # exported .pptx from your Apps Script Web App, patches the PPTX (decorative
 # flags on unlabeled shapes, whitespace-only paragraph cleanup -- footer
 # contrast is handled directly in the Apps Script, not here), converts it to
-# PDF with LibreOffice, then post-processes the PDF for PDF/UA: wraps the
-# untagged path objects LibreOffice itself draws (slide backgrounds -- the
-# one-per-page "Path object not tagged" failure) as artifacts, wraps the
-# DIV/Figure root elements in a proper /Document root, promotes the first
-# paragraph (cover title) to /H1 so the document contains a heading, and
-# writes the metadata LibreOffice leaves out (title, XMP, PDF/UA identifier,
-# DisplayDocTitle). Finally posts the finished PDF back to the same Web App
-# to save to Drive.
+# PDF with LibreOffice, then post-processes the PDF for PDF/UA:
+#   - retags whitespace-only leaf marked-content spans as artifacts (fixes
+#     "tagged text consists only of whitespace")
+#   - wraps every untagged path object LibreOffice draws itself (slide
+#     backgrounds) as an artifact (fixes "path object not tagged", one per
+#     page)
+#   - groups each page's structure elements into their own /Sect under a
+#     single /Document root instead of one flat pile (fixes "content in a
+#     possibly inadmissible location" and "DIV/Figure used as root element")
+#   - promotes the first paragraph (cover title) to /H1 so the document has
+#     a heading
+#   - writes the metadata LibreOffice leaves out (title, XMP, PDF/UA
+#     identifier, DisplayDocTitle)
+# Finally posts the finished PDF back to the same Web App to save to Drive.
+#
+# Speed: apt-get uses --no-install-recommends (skips LibreOffice components
+# this pipeline never uses -- Writer, Calc, Base, full language packs -- so
+# the "Install LibreOffice" step installs meaningfully less and finishes
+# faster on every single run, since GitHub Actions runners start clean each
+# time and nothing here is cached between runs).
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -30,7 +42,8 @@ jobs:
     steps:
       - name: Install LibreOffice, jq, pikepdf, and lxml
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq python3-pip
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libreoffice-impress jq python3-pip
           pip install --break-system-packages pikepdf lxml
 
       - name: Write PPTX accessibility patch script
@@ -219,6 +232,84 @@ jobs:
           PAINT_OPS = {'S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n'}
           STANDALONE_PAINT_OPS = {'sh'}
           HEADING_TAGS = {'/H', '/H1', '/H2', '/H3', '/H4', '/H5', '/H6'}
+          TEXT_SHOW_OPS = {'Tj', "'", '"'}
+          WHITESPACE_CHARS = set(' \t\r\n\x0b\x0c\xa0')
+
+
+          # ---------- 0. whitespace-only leaf marked-content spans ----------
+          #
+          # "Tagged text consists only of whitespace / its location can only be
+          # approximated": LibreOffice sometimes gives a lone space its own marked-
+          # content span (e.g. a run boundary between two differently-styled words).
+          # A screen reader gets no information from a bare space, and PAC can't
+          # compute a meaningful bounding box for an invisible glyph, hence the
+          # warning. Fix: for each LEAF marked-content span (no further BDC/BMC
+          # nested inside it -- real structural content is never touched) whose
+          # Tj/TJ text is non-empty and 100% whitespace, retag it BMC /Artifact
+          # instead of BDC /Tag <<...>>. Nested spans, and spans containing any
+          # real text, are left completely alone.
+          def artifact_whitespace_spans(pdf):
+              changed = 0
+              for page in pdf.pages:
+                  try:
+                      instructions = pikepdf.parse_content_stream(page)
+                  except Exception as exc:
+                      print('  skipping one page (unparseable content stream): %s' % exc)
+                      continue
+                  n = len(instructions)
+                  stack = []   # each: {'start': idx, 'texts': [], 'nested': False}
+                  convert = {}  # start_idx -> True (retag), populated as spans close
+                  page_changed = False
+
+                  for idx in range(n):
+                      op = str(getattr(instructions[idx], 'operator', ''))
+                      if op in ('BDC', 'BMC'):
+                          if stack:
+                              stack[-1]['nested'] = True
+                          stack.append({'start': idx, 'texts': [], 'nested': False})
+                      elif op == 'EMC':
+                          if not stack:
+                              continue
+                          span = stack.pop()
+                          if not span['nested']:
+                              text = ''.join(span['texts'])
+                              if text and all(c in WHITESPACE_CHARS for c in text):
+                                  convert[span['start']] = True
+                          if stack:
+                              # a whitespace leaf inside a real parent doesn't make
+                              # the parent whitespace-only; texts don't propagate up
+                              pass
+                      elif op in TEXT_SHOW_OPS and stack:
+                          try:
+                              s = instructions[idx].operands[-1]
+                              stack[-1]['texts'].append(str(s))
+                          except Exception:
+                              pass
+                      elif op == 'TJ' and stack:
+                          try:
+                              for el in instructions[idx].operands[0]:
+                                  if isinstance(el, (pikepdf.String, str, bytes)):
+                                      stack[-1]['texts'].append(str(el))
+                          except Exception:
+                              pass
+
+                  if not convert:
+                      continue
+
+                  out = []
+                  for idx, inst in enumerate(instructions):
+                      op = str(getattr(inst, 'operator', ''))
+                      if idx in convert and op == 'BDC':
+                          out.append(CSI([Name('/Artifact')], Operator('BMC')))
+                          page_changed = True
+                          changed += 1
+                      else:
+                          out.append(inst)
+
+                  if page_changed:
+                      page.Contents = pdf.make_indirect(pikepdf.Stream(
+                          pdf, pikepdf.unparse_content_stream(out)))
+              return changed
 
 
           # ---------- 1. artifact untagged path objects ----------
@@ -299,6 +390,26 @@ jobs:
                   stack.extend(reversed(struct_children(el)))
 
 
+          def resolve_element_page(el, inherited_pg=None, _depth=0):
+              """Best-effort page lookup for a structure element: its own /Pg, or
+              (failing that) the /Pg of the first descendant that has one. Used only
+              to group top-level elements by page -- never changes any element."""
+              if _depth > 25:
+                  return inherited_pg
+              pg = el.get('/Pg', None)
+              if pg is not None:
+                  return pg
+              for k in struct_children(el):
+                  if isinstance(k, pikepdf.Dictionary):
+                      if k.get('/Type') in (Name('/MCR'), Name('/OBJR')) and '/Pg' in k:
+                          return k.Pg
+                      if '/S' in k:
+                          res = resolve_element_page(k, inherited_pg, _depth + 1)
+                          if res is not None:
+                              return res
+              return inherited_pg
+
+
           def fix_structure_root(pdf):
               root = pdf.Root
               st = root.get('/StructTreeRoot')
@@ -308,25 +419,69 @@ jobs:
               kids = [k for k in kids if isinstance(k, pikepdf.Dictionary)]
               if not kids:
                   return 'structure tree has no element children'
-              if len(kids) == 1:
-                  s = str(kids[0].get('/S', ''))
-                  if s == '/Document':
-                      return 'root element is already /Document'
-                  kids[0][Name('/S')] = Name('/Document')
-                  return 'retyped single root element %s -> /Document' % s
+
+              # Group top-level elements by the page they belong to, so multi-page
+              # content doesn't sit as flat siblings directly under /Document (the
+              # "content in a possibly inadmissible location" pattern) -- each page
+              # gets its own /Sect wrapper instead.
+              groups = []      # [(page_key, page_obj_or_None, [elements])]
+              index_by_key = {}
+              for k in kids:
+                  pg = resolve_element_page(k)
+                  key = (pg.objgen if hasattr(pg, 'objgen') else None) if pg is not None else None
+                  if key not in index_by_key:
+                      index_by_key[key] = len(groups)
+                      groups.append([key, pg, []])
+                  groups[index_by_key[key]][2].append(k)
+
               doc = pdf.make_indirect(Dictionary(
                   Type=Name('/StructElem'),
                   S=Name('/Document'),
                   P=st,
-                  K=pikepdf.Array(kids),
               ))
-              for k in kids:
-                  try:
-                      k[Name('/P')] = doc
-                  except Exception:
-                      pass
+
+              if len(groups) <= 1:
+                  # Single page or page info unavailable for all elements: no
+                  # sectioning benefit, just parent everything under /Document.
+                  for k in kids:
+                      try:
+                          k[Name('/P')] = doc
+                      except Exception:
+                          pass
+                  doc[Name('/K')] = kids[0] if len(kids) == 1 else pikepdf.Array(kids)
+                  st[Name('/K')] = doc
+                  return 'wrapped %d root element(s) directly under /Document (single page group)' % len(kids)
+
+              sects = []
+              for key, pg, elems in groups:
+                  if len(elems) == 1 and pg is None:
+                      # Unknown page for a lone element: don't invent a section for
+                      # it, just attach it straight to /Document.
+                      try:
+                          elems[0][Name('/P')] = doc
+                      except Exception:
+                          pass
+                      sects.append(elems[0])
+                      continue
+                  sect = pdf.make_indirect(Dictionary(
+                      Type=Name('/StructElem'),
+                      S=Name('/Sect'),
+                      P=doc,
+                      K=pikepdf.Array(elems) if len(elems) > 1 else elems[0],
+                  ))
+                  if pg is not None:
+                      sect[Name('/Pg')] = pg
+                  for e in elems:
+                      try:
+                          e[Name('/P')] = sect
+                      except Exception:
+                          pass
+                  sects.append(sect)
+
+              doc[Name('/K')] = pikepdf.Array(sects) if len(sects) > 1 else sects[0]
               st[Name('/K')] = doc
-              return 'wrapped %d root elements in a new /Document' % len(kids)
+              return ('wrapped %d root elements into %d per-page /Sect elements '
+                      'under /Document' % (len(kids), len(groups)))
 
 
           def ensure_heading(pdf):
@@ -365,6 +520,9 @@ jobs:
 
           def main(path, title):
               with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+                  ws = artifact_whitespace_spans(pdf)
+                  print('fix_pdf_pdfua: retagged %d whitespace-only leaf spans as '
+                        'artifacts.' % ws)
                   n = artifact_untagged_paths(pdf)
                   print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
                   print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
@@ -427,7 +585,7 @@ jobs:
             catalog.pptx
           test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
 
-      - name: Post-process PDF for PDF/UA (artifacts, structure root, H1, metadata)
+      - name: Post-process PDF for PDF/UA (artifacts, sections, H1, metadata)
         run: python3 fix_pdf_pdfua.py catalog.pdf "Tree Catalog"
 
       - name: Send PDF back to Apps Script
