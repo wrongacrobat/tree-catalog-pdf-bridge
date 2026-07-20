@@ -507,102 +507,6 @@ jobs:
               return split_count
 
 
-          # ---------- 0a. link annotations nested inside a /Link structure element ----------
-          #
-          # LibreOffice's tagged-PDF export creates a real /Link annotation for a
-          # hyperlink run (correct - the link is clickable) but does NOT create a
-          # matching /Link structure element referencing it via /OBJR, which is
-          # what makes a link discoverable/navigable in the tag tree for a screen
-          # reader ("link annotation is not nested inside a link structure
-          # element" in PAC). Fix: find the leaf marked-content span(s) whose text
-          # is the short link label ("More info", possibly wrapped across lines
-          # into separate "More" / "info" spans - LibreOffice gives each wrapped
-          # line its own /P), retag that /P as /Link, and append an /OBJR
-          # pointing at the actual annotation so AT can both read and activate it.
-          # Matches by TEXT rather than position because the label is short,
-          # fixed, and unique enough on the page not to need geometry.
-          LINK_TEXT_PATTERN = re.compile(r'^(more|info|more\s+info)\.?$', re.IGNORECASE)
-
-          def link_structure_elements(pdf, pattern):
-              fixed = 0
-              st = pdf.Root.get('/StructTreeRoot')
-              if st is None:
-                  return fixed
-              top_kids = struct_children(st)
-
-              for page in pdf.pages:
-                  annots = page.obj.get('/Annots')
-                  link_annots = [a for a in annots if a.get('/Subtype') == Name('/Link')] if annots else []
-                  if not link_annots:
-                      continue
-
-                  page_objgen = page.obj.objgen
-                  decoders = build_font_decoders(page)
-                  texts = {}
-                  mcid_stack = []
-                  cur_font = None
-                  for operands, operator in pikepdf.parse_content_stream(page):
-                      opn = str(operator)
-                      if opn == 'BDC':
-                          props = operands[1] if len(operands) > 1 else None
-                          mcid = int(props.MCID) if isinstance(props, pikepdf.Dictionary) and '/MCID' in props else None
-                          mcid_stack.append(mcid)
-                      elif opn == 'EMC':
-                          if mcid_stack:
-                              mcid_stack.pop()
-                      elif opn == 'Tf':
-                          try:
-                              cur_font = str(operands[0])
-                          except Exception:
-                              cur_font = None
-                      elif opn in TEXT_SHOW_OPS:
-                          if mcid_stack and mcid_stack[-1] is not None:
-                              width, mapping = decoders.get(cur_font, (1, {}))
-                              texts.setdefault(mcid_stack[-1], []).append(
-                                  decode_pdf_string(bytes(operands[-1]), width, mapping))
-                      elif opn == 'TJ':
-                          if mcid_stack and mcid_stack[-1] is not None:
-                              width, mapping = decoders.get(cur_font, (1, {}))
-                              parts = []
-                              for item in operands[0]:
-                                  if isinstance(item, (bytes, pikepdf.String)):
-                                      parts.append(decode_pdf_string(bytes(item), width, mapping))
-                              texts.setdefault(mcid_stack[-1], []).append(''.join(parts))
-                  texts = {k: ''.join(v) for k, v in texts.items()}
-
-                  matches = []
-                  seen_ids = set()
-
-                  def walk(el, cur_page=None):
-                      my_page = el.get('/Pg', cur_page)
-                      for c in struct_children(el):
-                          if isinstance(c, int):
-                              if my_page is not None and my_page.objgen == page_objgen:
-                                  t = texts.get(c, '').strip()
-                                  if pattern.match(t) and str(el.get('/S')) != '/Link' and id(el) not in seen_ids:
-                                      seen_ids.add(id(el))
-                                      matches.append(el)
-                          elif isinstance(c, pikepdf.Dictionary) and '/S' in c:
-                              c_page = c.get('/Pg', my_page)
-                              if c_page is not None and c_page.objgen != page_objgen:
-                                  continue
-                              walk(c, c_page)
-
-                  for k in top_kids:
-                      if isinstance(k, pikepdf.Dictionary):
-                          walk(k)
-
-                  for el, annot in zip(matches, link_annots):
-                      el[Name('/S')] = Name('/Link')
-                      k = el.get('/K')
-                      items = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
-                      items.append(Dictionary(Type=Name('/OBJR'), Obj=annot))
-                      el[Name('/K')] = pikepdf.Array(items)
-                      fixed += 1
-
-              return fixed
-
-
           # ---------- 0. whitespace-only leaf marked-content spans ----------
           #
           # "Tagged text consists only of whitespace / its location can only be
@@ -904,9 +808,6 @@ jobs:
                   mc = fix_marked_content_qQ_nesting(pdf)
                   print('fix_pdf_pdfua: split %d marked-content spans that crossed a '
                         'q/Q boundary into properly-nested pieces.' % mc)
-                  lk = link_structure_elements(pdf, LINK_TEXT_PATTERN)
-                  print('fix_pdf_pdfua: nested %d link annotation(s) inside a /Link '
-                        'structure element.' % lk)
                   ws = artifact_whitespace_spans(pdf)
                   print('fix_pdf_pdfua: retagged %d whitespace-only leaf spans as '
                         'artifacts.' % ws)
