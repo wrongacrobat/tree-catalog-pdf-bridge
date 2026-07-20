@@ -1,34 +1,12 @@
 # Put this file at: .github/workflows/convert-to-pdf.yml in your repo
 #
 # Triggered by Apps Script (Step 5b) via the GitHub REST API. Downloads the
-# exported .pptx from your Apps Script Web App, patches the PPTX (decorative
-# flags on unlabeled shapes, whitespace-only paragraph cleanup -- footer
-# contrast is handled directly in the Apps Script, not here), converts it to
-# PDF with LibreOffice, then post-processes the PDF for PDF/UA:
-#   - retags whitespace-only leaf marked-content spans as artifacts, using
-#     each font's /ToUnicode CMap to correctly decode text (LibreOffice's
-#     Tj/TJ bytes are raw glyph indices into the embedded subset font, NOT
-#     character codes -- comparing them to a literal space never matches)
-#   - wraps every untagged path object LibreOffice draws itself (slide
-#     backgrounds) as an artifact
-#   - groups each page's structure elements into their own /Sect under a
-#     single /Document root instead of one flat pile
-#   - promotes the first paragraph (cover title) to /H1 so the document has
-#     a heading
-#   - writes the metadata LibreOffice leaves out (title, XMP, PDF/UA
-#     identifier, DisplayDocTitle)
-#
-# NOTE: an earlier version of this script also tried to fix PAC's "Marked
-# content is present in admissible locations" warning by splitting and
-# re-tagging marked-content spans that cross a q/Q boundary. That attempt
-# is REMOVED here -- it required updating the PDF's /ParentTree (the MCID
-# index) and it didn't, which turned one warning into two real errors
-# ("entry for given MCID missing" and "tagged content present inside an
-# artifact"). A correct fix needs full ParentTree surgery verified against
-# PAC directly; until that's built and tested properly, this script leaves
-# that one warning alone rather than risk producing a broken PDF. Every fix
-# above this note is verified safe against a real exported catalog.
-# Finally posts the finished PDF back to the same Web App to save to Drive.
+# exported .pptx from your Apps Script Web App, converts it to PDF with
+# LibreOffice (this is what turns your alt text into real, tagged PDF
+# accessibility tags -- Google's own PDF export cannot do this), patches in
+# the PDF/UA metadata LibreOffice leaves out (title, XMP, PDF/UA identifier,
+# DisplayDocTitle), and posts the finished PDF back to the same Web App to
+# be saved into Drive.
 name: Convert Slides PPTX to Tagged PDF
 
 on:
@@ -45,609 +23,55 @@ jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
-      - name: Install LibreOffice, jq, pikepdf, and lxml
+      - name: Install LibreOffice, jq, and pikepdf
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libreoffice-impress jq python3-pip
-          pip install --break-system-packages pikepdf lxml
+          sudo apt-get update -qq && sudo apt-get install -y libreoffice-impress jq python3-pip
+          pip install --break-system-packages pikepdf
 
-      - name: Write PPTX accessibility patch script
+      - name: Write PDF/UA metadata fix script
         run: |
-          cat > fix_pptx_accessibility.py << 'PYEOF'
+          cat > fix_pdf_metadata.py << 'PYEOF'
           #!/usr/bin/env python3
-          """Patches a .pptx before LibreOffice conversion.
-
-          A) Decorative flags: every textless, unlabeled shape/picture/connector
-             (and every "Blank spacer." filler icon) gets the adec:decorative
-             OOXML flag, which LibreOffice 7.6+ exports as a PDF artifact. A short
-             non-empty descr is also set as a fallback. Fixes the 'Alternative
-             text for Figure' failures and shape-level untagged paths.
-
-          B) Whitespace cleanup (slides only): paragraphs whose runs are ALL
-             whitespace get their text emptied (the paragraph/line break stays,
-             so layout spacing is preserved). Whitespace runs BETWEEN real text
-             runs are never touched. Fixes 'Tagged text consists only of
-             whitespace' warnings that survive the Apps Script's shape-level
-             cleanup.
-
-          NOTE: footer contrast (page number / date backing color) is handled in
-          the Apps Script itself, in addPageDecorations_ -- not here. This script
-          never forces a background fill on any shape.
-          """
-          import os
+          """Fixes the PAC 'Metadata and Settings' errors LibreOffice leaves
+          behind: missing XMP metadata, missing PDF/UA identifier, missing
+          Title in XMP, and DisplayDocTitle not set."""
           import sys
-          import zipfile
-
-          from lxml import etree
-
-          P    = 'http://schemas.openxmlformats.org/presentationml/2006/main'
-          A    = 'http://schemas.openxmlformats.org/drawingml/2006/main'
-          ADEC = 'http://schemas.microsoft.com/office/drawing/2017/decorative'
-          DECOR_URI = '{C183D7F6-B498-43B3-948B-1728B52AA6E4}'
-
-          NVPR = {'sp': 'nvSpPr', 'pic': 'nvPicPr', 'cxnSp': 'nvCxnSpPr'}
-          # Keep in sync with CONFIG.BLANK_ICON_ALT_TEXT in the Apps Script.
-          BLANK_ALTS = {'blank spacer.', 'blank spacer'}
-          FALLBACK_DESCR = 'Decorative graphic.'
-
-
-          def q(ns, tag):
-              return '{%s}%s' % (ns, tag)
-
-
-          def has_visible_text(el):
-              for t in el.iter(q(A, 't')):
-                  if t.text and t.text.strip():
-                      return True
-              return False
-
-
-          # ---------- A) decorative ----------
-
-          def mark_decorative(cnvpr):
-              ext_lst = cnvpr.find(q(A, 'extLst'))
-              if ext_lst is None:
-                  ext_lst = etree.SubElement(cnvpr, q(A, 'extLst'))
-              for e in ext_lst.findall(q(A, 'ext')):
-                  if e.get('uri') == DECOR_URI:
-                      return False
-              ext = etree.SubElement(ext_lst, q(A, 'ext'), {'uri': DECOR_URI})
-              etree.SubElement(ext, q(ADEC, 'decorative'), {'val': '1'})
-              return True
-
-
-          # ---------- B) whitespace paragraphs ----------
-
-          def clear_whitespace_paragraphs(root):
-              n = 0
-              for par in root.iter(q(A, 'p')):
-                  ts = par.findall('.//' + q(A, 't'))
-                  if not ts:
-                      continue
-                  texts = [t.text or '' for t in ts]
-                  if any(x.strip() for x in texts):
-                      continue  # paragraph has real text: leave every run alone
-                  if not any(texts):
-                      continue  # already empty
-                  for t in ts:
-                      t.text = ''
-                  n += 1
-              return n
-
-
-          # ---------- driver ----------
-
-          def patch_part(data, is_slide):
-              root = etree.fromstring(data)
-              decorated = 0
-              for tag, nv in NVPR.items():
-                  for el in root.iter(q(P, tag)):
-                      nvpr = el.find(q(P, nv))
-                      if nvpr is None:
-                          continue
-                      cnvpr = nvpr.find(q(P, 'cNvPr'))
-                      if cnvpr is None:
-                          continue
-
-                      if tag == 'sp' and has_visible_text(el):
-                          continue  # real text content: tagged normally, left alone
-
-                      descr = (cnvpr.get('descr') or '').strip()
-                      title = (cnvpr.get('title') or '').strip()
-
-                      if descr.lower() in BLANK_ALTS:
-                          # Filler icon: artifact beats a "Blank spacer" Figure a
-                          # screen reader would otherwise have to announce.
-                          if mark_decorative(cnvpr):
-                              decorated += 1
-                          continue
-
-                      if descr or title:
-                          continue  # author-labeled: keep as a labeled Figure
-
-                      # Textless AND unlabeled: the PAC failure cases.
-                      cnvpr.set('descr', FALLBACK_DESCR)
-                      mark_decorative(cnvpr)
-                      decorated += 1
-
-              ws = clear_whitespace_paragraphs(root) if is_slide else 0
-              return (
-                  etree.tostring(root, xml_declaration=True, encoding='UTF-8',
-                                 standalone=True),
-                  decorated, ws,
-              )
-
-
-          def main(path):
-              tmp = path + '.tmp'
-              dec = ws = parts = 0
-              with zipfile.ZipFile(path) as zin, \
-                   zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
-                  for item in zin.infolist():
-                      data = zin.read(item.filename)
-                      name = item.filename
-                      if name.endswith('.xml') and (
-                              name.startswith('ppt/slides/slide') or
-                              name.startswith('ppt/slideLayouts/') or
-                              name.startswith('ppt/slideMasters/')):
-                          is_slide = name.startswith('ppt/slides/slide')
-                          data, d, w = patch_part(data, is_slide)
-                          dec += d
-                          ws += w
-                          parts += 1
-                      zout.writestr(item, data)
-              os.replace(tmp, path)
-              print('fix_pptx_accessibility: %d parts patched -- %d objects marked '
-                    'decorative, %d whitespace-only paragraphs emptied. (Footer '
-                    'contrast is handled in Apps Script, not here.)'
-                    % (parts, dec, ws))
-
-
-          if __name__ == '__main__':
-              if len(sys.argv) < 2:
-                  sys.exit('usage: fix_pptx_accessibility.py <file.pptx>')
-              main(sys.argv[1])
-          PYEOF
-          echo "fix_pptx_accessibility.py written, $(wc -l < fix_pptx_accessibility.py) lines."
-
-      - name: Write PDF/UA post-processing script
-        run: |
-          cat > fix_pdf_pdfua.py << 'PYEOF'
-          #!/usr/bin/env python3
-          """Post-processes the LibreOffice tagged PDF into PDF/UA shape.
-
-          1. Wraps every untagged path drawing (LibreOffice draws the slide
-             background itself, outside any tag -- the per-page 'Path object not
-             tagged' failure) in /Artifact BMC ... EMC.
-          2. Ensures the structure tree root child is a single /Document element
-             (fixes 'DIV/Figure structure element used as root element').
-          3. Promotes the first paragraph in reading order (the cover title) to
-             /H1 if the document has no headings at all.
-          4. Writes the metadata LibreOffice leaves out: XMP title, PDF/UA
-             identifier, DisplayDocTitle, MarkInfo, Lang.
-          """
-          import re
-          import sys
-
           import pikepdf
-          from pikepdf import Dictionary, Name, Operator
-
-          CSI = pikepdf.ContentStreamInstruction
-
-          PATH_OPS = {'m', 'l', 'c', 'v', 'y', 're', 'h', 'W', 'W*'}
-          PAINT_OPS = {'S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n'}
-          STANDALONE_PAINT_OPS = {'sh'}
-          HEADING_TAGS = {'/H', '/H1', '/H2', '/H3', '/H4', '/H5', '/H6'}
-          TEXT_SHOW_OPS = {'Tj', "'", '"'}
-          WHITESPACE_CHARS = set(' \t\r\n\x0b\x0c\xa0')
+          from pikepdf import Name, Dictionary
 
 
-          # ---------- font decoding ----------
-          #
-          # Tj/TJ operands in a LibreOffice-exported PDF are raw GLYPH INDICES into
-          # the embedded subset font (e.g. b'\x01' for whatever glyph happens to be
-          # first in that subset) -- NOT character codes. Comparing those bytes
-          # directly against ' ' never matches, even for an actual space glyph, so
-          # any whitespace-detection that skips this step silently finds nothing.
-          # The font's /ToUnicode CMap is what maps glyph code -> real Unicode text;
-          # every font LibreOffice embeds carries one.
-          def parse_tounicode_cmap(data):
-              text = data.decode('latin-1', errors='replace')
-              width = 1
-              m = re.search(r'begincodespacerange(.*?)endcodespacerange', text, re.S)
-              if m:
-                  hexes = re.findall(r'<([0-9A-Fa-f]+)>', m.group(1))
-                  if hexes:
-                      width = max(1, len(hexes[0]) // 2)
-              mapping = {}
-              for m in re.finditer(r'beginbfchar(.*?)endbfchar', text, re.S):
-                  for src, dst in re.findall(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', m.group(1)):
-                      try:
-                          mapping[int(src, 16)] = bytes.fromhex(dst).decode('utf-16-be')
-                      except Exception:
-                          pass
-              for m in re.finditer(r'beginbfrange(.*?)endbfrange', text, re.S):
-                  for rm in re.finditer(
-                          r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]+>|\[[^\]]*\])',
-                          m.group(1)):
-                      lo, hi, dst = rm.group(1), rm.group(2), rm.group(3)
-                      lo_i, hi_i = int(lo, 16), int(hi, 16)
-                      if dst.startswith('['):
-                          dsts = re.findall(r'<([0-9A-Fa-f]+)>', dst)
-                          for i, code in enumerate(range(lo_i, hi_i + 1)):
-                              if i < len(dsts):
-                                  try:
-                                      mapping[code] = bytes.fromhex(dsts[i]).decode('utf-16-be')
-                                  except Exception:
-                                      pass
-                      else:
-                          dst_hex = dst.strip('<>')
-                          base = int(dst_hex, 16)
-                          nbytes = max(2, (len(dst_hex) + 1) // 2)
-                          for i, code in enumerate(range(lo_i, hi_i + 1)):
-                              try:
-                                  mapping[code] = (base + i).to_bytes(
-                                      nbytes, 'big').decode('utf-16-be', errors='ignore')
-                              except Exception:
-                                  pass
-              return width, mapping
-
-
-          def build_font_decoders(page):
-              """{font_resource_name (e.g. '/F1'): (byte_width, {code: unicode})}
-              for every font on this page we can safely decode:
-                - if it carries a /ToUnicode CMap, use that (always correct, and
-                  the only correct option for LibreOffice's embedded subset fonts,
-                  whose Tj/TJ bytes are glyph indices, not character codes)
-                - otherwise, if it's a SIMPLE (single-byte, non-composite) font,
-                  its raw codes are WinAnsi-ish character codes directly, so a
-                  byte value = codepoint fallback is safe (this is what covers
-                  plain base-14 fonts with no embedded ToUnicode)
-                - a composite font with no ToUnicode is left out entirely: its
-                  text is treated as unknown and never guessed at as whitespace
-              """
-              decoders = {}
-              try:
-                  fonts = page.obj.get('/Resources', {}).get('/Font', {})
-              except Exception:
-                  return decoders
-              for name, font in fonts.items():
-                  try:
-                      if '/ToUnicode' in font:
-                          decoders[name] = parse_tounicode_cmap(font.ToUnicode.read_bytes())
-                          continue
-                      subtype = str(font.get('/Subtype', ''))
-                      if subtype in ('/Type1', '/TrueType', '/MMType1', '/Type3'):
-                          decoders[name] = (1, {c: chr(c) for c in range(256)})
-                  except Exception:
-                      continue
-              return decoders
-
-
-          def decode_pdf_string(raw, width, mapping):
-              out = []
-              for i in range(0, len(raw) - width + 1, width):
-                  code = int.from_bytes(raw[i:i + width], 'big')
-                  out.append(mapping.get(code, '\ufffd'))  # unknown glyph: not whitespace
-              return ''.join(out)
-
-
-          # ---------- 0. whitespace-only leaf marked-content spans ----------
-          #
-          # "Tagged text consists only of whitespace / its location can only be
-          # approximated": LibreOffice sometimes gives a lone space its own marked-
-          # content span (e.g. a run boundary between two differently-styled words).
-          # A screen reader gets no information from a bare space, and PAC can't
-          # compute a meaningful bounding box for an invisible glyph, hence the
-          # warning. Fix: for each LEAF marked-content span (no further BDC/BMC
-          # nested inside it -- real structural content is never touched) whose
-          # Tj/TJ text is non-empty and 100% whitespace, retag it BMC /Artifact
-          # instead of BDC /Tag <<...>>. Nested spans, and spans containing any
-          # real text, are left completely alone.
-          def artifact_whitespace_spans(pdf):
-              changed = 0
-              for page in pdf.pages:
-                  try:
-                      instructions = pikepdf.parse_content_stream(page)
-                  except Exception as exc:
-                      print('  skipping one page (unparseable content stream): %s' % exc)
-                      continue
-                  font_decoders = build_font_decoders(page)
-                  cur_font = None
-                  n = len(instructions)
-                  stack = []   # each: {'start': idx, 'texts': [], 'nested': False}
-                  convert = {}  # start_idx -> True (retag), populated as spans close
-                  page_changed = False
-
-                  for idx in range(n):
-                      inst = instructions[idx]
-                      op = str(getattr(inst, 'operator', ''))
-                      if op == 'Tf':
-                          try:
-                              cur_font = str(inst.operands[0])
-                          except Exception:
-                              cur_font = None
-                      elif op in ('BDC', 'BMC'):
-                          if stack:
-                              stack[-1]['nested'] = True
-                          stack.append({'start': idx, 'texts': [], 'nested': False})
-                      elif op == 'EMC':
-                          if not stack:
-                              continue
-                          span = stack.pop()
-                          if not span['nested']:
-                              text = ''.join(span['texts'])
-                              if text and '\ufffd' not in text and \
-                                      all(c in WHITESPACE_CHARS for c in text):
-                                  convert[span['start']] = True
-                      elif op in TEXT_SHOW_OPS and stack:
-                          width, mapping = font_decoders.get(cur_font, (0, None))
-                          if mapping is not None:
-                              try:
-                                  stack[-1]['texts'].append(
-                                      decode_pdf_string(bytes(inst.operands[-1]), width, mapping))
-                              except Exception:
-                                  stack[-1]['texts'].append('\ufffd')
-                          else:
-                              stack[-1]['texts'].append('\ufffd')  # unknown font: don't guess
-                      elif op == 'TJ' and stack:
-                          width, mapping = font_decoders.get(cur_font, (0, None))
-                          try:
-                              for el in inst.operands[0]:
-                                  if isinstance(el, pikepdf.String):
-                                      if mapping is not None:
-                                          stack[-1]['texts'].append(
-                                              decode_pdf_string(bytes(el), width, mapping))
-                                      else:
-                                          stack[-1]['texts'].append('\ufffd')
-                          except Exception:
-                              pass
-
-                  if not convert:
-                      continue
-
-                  out = []
-                  for idx, inst in enumerate(instructions):
-                      op = str(getattr(inst, 'operator', ''))
-                      if idx in convert and op == 'BDC':
-                          out.append(CSI([Name('/Artifact')], Operator('BMC')))
-                          page_changed = True
-                          changed += 1
-                      else:
-                          out.append(inst)
-
-                  if page_changed:
-                      page.Contents = pdf.make_indirect(pikepdf.Stream(
-                          pdf, pikepdf.unparse_content_stream(out)))
-              return changed
-
-
-          # ---------- 1. artifact untagged path objects ----------
-
-          def artifact_untagged_paths(pdf):
-              wrapped = 0
-              for page in pdf.pages:
-                  try:
-                      instructions = pikepdf.parse_content_stream(page)
-                  except Exception as exc:  # malformed page: leave untouched
-                      print('  skipping one page (unparseable content stream): %s' % exc)
-                      continue
-                  out = []
-                  depth = 0          # marked-content nesting depth
-                  pathbuf = []       # buffered untagged path-construction ops
-                  changed = False
-                  for inst in instructions:
-                      op = str(getattr(inst, 'operator', ''))
-                      if pathbuf:
-                          if op in PATH_OPS:
-                              pathbuf.append(inst)
-                              continue
-                          if op in PAINT_OPS:
-                              out.append(CSI([Name('/Artifact')], Operator('BMC')))
-                              out.extend(pathbuf)
-                              out.append(inst)
-                              out.append(CSI([], Operator('EMC')))
-                              pathbuf = []
-                              changed = True
-                              wrapped += 1
-                              continue
-                          # unexpected operator mid-path: flush the buffer unwrapped
-                          out.extend(pathbuf)
-                          pathbuf = []
-                      if op in ('BDC', 'BMC'):
-                          depth += 1
-                      elif op == 'EMC':
-                          depth = max(0, depth - 1)
-                      elif depth == 0 and op in PATH_OPS:
-                          pathbuf = [inst]
-                          continue
-                      elif depth == 0 and op in STANDALONE_PAINT_OPS:
-                          out.append(CSI([Name('/Artifact')], Operator('BMC')))
-                          out.append(inst)
-                          out.append(CSI([], Operator('EMC')))
-                          changed = True
-                          wrapped += 1
-                          continue
-                      out.append(inst)
-                  if pathbuf:
-                      out.extend(pathbuf)
-                  if changed:
-                      page.Contents = pdf.make_indirect(
-                          pikepdf.Stream(pdf, pikepdf.unparse_content_stream(out)))
-              return wrapped
-
-
-          # ---------- 2 & 3. structure tree fixes ----------
-
-          def struct_children(node):
-              k = node.get('/K')
-              if k is None:
-                  return []
-              if isinstance(k, pikepdf.Array):
-                  return list(k)
-              return [k]
-
-
-          def iter_struct_elems(roots):
-              """Preorder walk over structure elements (dicts with /S)."""
-              stack = list(reversed(roots))
-              while stack:
-                  el = stack.pop()
-                  if not isinstance(el, pikepdf.Dictionary):
-                      continue  # MCID integers
-                  if '/S' in el:
-                      yield el
-                  stack.extend(reversed(struct_children(el)))
-
-
-          def resolve_element_page(el, inherited_pg=None, _depth=0):
-              """Best-effort page lookup for a structure element: its own /Pg, or
-              (failing that) the /Pg of the first descendant that has one. Used only
-              to group top-level elements by page -- never changes any element."""
-              if _depth > 25:
-                  return inherited_pg
-              pg = el.get('/Pg', None)
-              if pg is not None:
-                  return pg
-              for k in struct_children(el):
-                  if isinstance(k, pikepdf.Dictionary):
-                      if k.get('/Type') in (Name('/MCR'), Name('/OBJR')) and '/Pg' in k:
-                          return k.Pg
-                      if '/S' in k:
-                          res = resolve_element_page(k, inherited_pg, _depth + 1)
-                          if res is not None:
-                              return res
-              return inherited_pg
-
-
-          def fix_structure_root(pdf):
-              root = pdf.Root
-              st = root.get('/StructTreeRoot')
-              if st is None:
-                  return 'no structure tree present, nothing to fix'
-              kids = struct_children(st)
-              kids = [k for k in kids if isinstance(k, pikepdf.Dictionary)]
-              if not kids:
-                  return 'structure tree has no element children'
-
-              # Group top-level elements by the page they belong to, so multi-page
-              # content doesn't sit as flat siblings directly under /Document (the
-              # "content in a possibly inadmissible location" pattern) -- each page
-              # gets its own /Sect wrapper instead.
-              groups = []      # [(page_key, page_obj_or_None, [elements])]
-              index_by_key = {}
-              for k in kids:
-                  pg = resolve_element_page(k)
-                  key = (pg.objgen if hasattr(pg, 'objgen') else None) if pg is not None else None
-                  if key not in index_by_key:
-                      index_by_key[key] = len(groups)
-                      groups.append([key, pg, []])
-                  groups[index_by_key[key]][2].append(k)
-
-              doc = pdf.make_indirect(Dictionary(
-                  Type=Name('/StructElem'),
-                  S=Name('/Document'),
-                  P=st,
-              ))
-
-              if len(groups) <= 1:
-                  # Single page or page info unavailable for all elements: no
-                  # sectioning benefit, just parent everything under /Document.
-                  for k in kids:
-                      try:
-                          k[Name('/P')] = doc
-                      except Exception:
-                          pass
-                  doc[Name('/K')] = kids[0] if len(kids) == 1 else pikepdf.Array(kids)
-                  st[Name('/K')] = doc
-                  return 'wrapped %d root element(s) directly under /Document (single page group)' % len(kids)
-
-              sects = []
-              for key, pg, elems in groups:
-                  if len(elems) == 1 and pg is None:
-                      # Unknown page for a lone element: don't invent a section for
-                      # it, just attach it straight to /Document.
-                      try:
-                          elems[0][Name('/P')] = doc
-                      except Exception:
-                          pass
-                      sects.append(elems[0])
-                      continue
-                  sect = pdf.make_indirect(Dictionary(
-                      Type=Name('/StructElem'),
-                      S=Name('/Sect'),
-                      P=doc,
-                      K=pikepdf.Array(elems) if len(elems) > 1 else elems[0],
-                  ))
-                  if pg is not None:
-                      sect[Name('/Pg')] = pg
-                  for e in elems:
-                      try:
-                          e[Name('/P')] = sect
-                      except Exception:
-                          pass
-                  sects.append(sect)
-
-              doc[Name('/K')] = pikepdf.Array(sects) if len(sects) > 1 else sects[0]
-              st[Name('/K')] = doc
-              return ('wrapped %d root elements into %d per-page /Sect elements '
-                      'under /Document' % (len(kids), len(groups)))
-
-
-          def ensure_heading(pdf):
-              st = pdf.Root.get('/StructTreeRoot')
-              if st is None:
-                  return 'no structure tree, cannot add a heading'
-              roots = [k for k in struct_children(st) if isinstance(k, pikepdf.Dictionary)]
-              for el in iter_struct_elems(roots):
-                  if str(el.get('/S', '')) in HEADING_TAGS:
-                      return 'document already contains headings'
-              for el in iter_struct_elems(roots):
-                  if str(el.get('/S', '')) == '/P':
-                      el[Name('/S')] = Name('/H1')
-                      return 'promoted first paragraph in reading order to /H1'
-              return 'no /P element found to promote'
-
-
-          # ---------- 4. metadata ----------
-
-          def fix_metadata(pdf, title):
-              with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
-                  meta['dc:title'] = title
-                  meta['pdfuaid:part'] = '1'
-              pdf.docinfo['/Title'] = title
-              root = pdf.Root
-              if '/ViewerPreferences' not in root:
-                  root.ViewerPreferences = pdf.make_indirect(Dictionary())
-              root.ViewerPreferences[Name('/DisplayDocTitle')] = True
-              if '/MarkInfo' not in root:
-                  root.MarkInfo = pdf.make_indirect(Dictionary(Marked=True))
-              elif '/Marked' not in root.MarkInfo:
-                  root.MarkInfo[Name('/Marked')] = True
-              if '/Lang' not in root:
-                  root[Name('/Lang')] = pikepdf.String('en-US')
-
-
-          def main(path, title):
+          def fix(path: str, title: str) -> None:
               with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-                  ws = artifact_whitespace_spans(pdf)
-                  print('fix_pdf_pdfua: retagged %d whitespace-only leaf spans as '
-                        'artifacts.' % ws)
-                  n = artifact_untagged_paths(pdf)
-                  print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
-                  print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
-                  print('fix_pdf_pdfua: headings: %s.' % ensure_heading(pdf))
-                  fix_metadata(pdf, title)
+                  with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                      meta["dc:title"] = title
+                      meta["pdfuaid:part"] = "1"
+
+                  pdf.docinfo["/Title"] = title
+
+                  root = pdf.Root
+                  if "/ViewerPreferences" not in root:
+                      root.ViewerPreferences = pdf.make_indirect(Dictionary())
+                  root.ViewerPreferences[Name("/DisplayDocTitle")] = True
+
+                  if "/MarkInfo" not in root:
+                      root.MarkInfo = pdf.make_indirect(Dictionary(Marked=True))
+                  elif "/Marked" not in root.MarkInfo:
+                      root.MarkInfo[Name("/Marked")] = True
+                  if "/Lang" not in root:
+                      root[Name("/Lang")] = pikepdf.String("en-US")
+
                   pdf.save(path)
-              print('fix_pdf_pdfua: wrote title, XMP, PDF/UA id, and viewer prefs to %s' % path)
+              print(f"fix_pdf_metadata: wrote title, XMP, PDF/UA id, and viewer prefs to {path}")
 
 
-          if __name__ == '__main__':
+          if __name__ == "__main__":
               if len(sys.argv) < 2:
-                  sys.exit('usage: fix_pdf_pdfua.py <file.pdf> [title]')
-              main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'Tree Catalog')
+                  sys.exit("usage: fix_pdf_metadata.py <file.pdf> [title]")
+              pdf_path = sys.argv[1]
+              doc_title = sys.argv[2] if len(sys.argv) > 2 else "Tree Catalog"
+              fix(pdf_path, doc_title)
           PYEOF
-          echo "fix_pdf_pdfua.py written, $(wc -l < fix_pdf_pdfua.py) lines."
+          echo "fix_pdf_metadata.py written, $(wc -l < fix_pdf_metadata.py) lines."
 
       - name: Download PPTX from Apps Script
         run: |
@@ -685,18 +109,13 @@ jobs:
 
           test -s catalog.pptx || (echo "Downloaded pptx is empty -- check the Web App URL/secret and that Step 5b has run." && exit 1)
 
-      - name: Patch PPTX (decorative flags, whitespace cleanup)
-        run: python3 fix_pptx_accessibility.py catalog.pptx
-
       - name: Convert to tagged PDF
         run: |
-          soffice --headless --norestore --convert-to \
-            'pdf:impress_pdf_Export:{"UseTaggedPDF":{"type":"boolean","value":true},"SelectPdfVersion":{"type":"long","value":17}}' \
-            catalog.pptx
+          soffice --headless --norestore --convert-to pdf catalog.pptx
           test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
 
-      - name: Post-process PDF for PDF/UA (artifacts, sections, H1, metadata)
-        run: python3 fix_pdf_pdfua.py catalog.pdf "Tree Catalog"
+      - name: Fix PDF/UA metadata (title, XMP, PDF/UA id, DisplayDocTitle)
+        run: python3 fix_pdf_metadata.py catalog.pdf "Tree Catalog"
 
       - name: Send PDF back to Apps Script
         run: |
