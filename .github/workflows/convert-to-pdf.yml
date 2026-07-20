@@ -5,24 +5,29 @@
 # flags on unlabeled shapes, whitespace-only paragraph cleanup -- footer
 # contrast is handled directly in the Apps Script, not here), converts it to
 # PDF with LibreOffice, then post-processes the PDF for PDF/UA:
-#   - fixes "Marked content is present in admissible locations": LibreOffice
-#     places some marked-content spans (a background Artifact on every page,
-#     plus a photo Figure and a decorative Div on cover/divider pages) so
-#     they cross a q/Q graphics-state boundary. Each violating span is split
-#     into two properly-nested pieces; real tagged content gets a second
-#     MCID added to the SAME structure element rather than losing its tag.
 #   - retags whitespace-only leaf marked-content spans as artifacts, using
 #     each font's /ToUnicode CMap to correctly decode text (LibreOffice's
 #     Tj/TJ bytes are raw glyph indices into the embedded subset font, NOT
-#     character codes)
-#   - wraps every untagged path object LibreOffice draws itself as an
-#     artifact
+#     character codes -- comparing them to a literal space never matches)
+#   - wraps every untagged path object LibreOffice draws itself (slide
+#     backgrounds) as an artifact
 #   - groups each page's structure elements into their own /Sect under a
 #     single /Document root instead of one flat pile
 #   - promotes the first paragraph (cover title) to /H1 so the document has
 #     a heading
 #   - writes the metadata LibreOffice leaves out (title, XMP, PDF/UA
 #     identifier, DisplayDocTitle)
+#
+# NOTE: an earlier version of this script also tried to fix PAC's "Marked
+# content is present in admissible locations" warning by splitting and
+# re-tagging marked-content spans that cross a q/Q boundary. That attempt
+# is REMOVED here -- it required updating the PDF's /ParentTree (the MCID
+# index) and it didn't, which turned one warning into two real errors
+# ("entry for given MCID missing" and "tagged content present inside an
+# artifact"). A correct fix needs full ParentTree surgery verified against
+# PAC directly; until that's built and tested properly, this script leaves
+# that one warning alone rather than risk producing a broken PDF. Every fix
+# above this note is verified safe against a real exported catalog.
 # Finally posts the finished PDF back to the same Web App to save to Drive.
 name: Convert Slides PPTX to Tagged PDF
 
@@ -327,186 +332,6 @@ jobs:
               return ''.join(out)
 
 
-          # ---------- -1. marked content q/Q nesting ----------
-          #
-          # "Marked content is present in admissible locations": PDF/UA requires a
-          # BDC/BMC ... EMC span to stay fully inside whichever q/Q (graphics state
-          # save/restore) frames were already open when it started -- it must not
-          # outlive one of those frames. LibreOffice's own per-slide decorations
-          # (a background Artifact, and on divider/cover pages a photo Figure and a
-          # decorative Div) do this on every page: a Q closes a frame that was open
-          # before the marked content began, even though the numeric q-depth can
-          # look "balanced" again moments later from a *different* q. Simple depth
-          # counting misses that case, so this tracks actual frame identity.
-          #
-          # Fix, applied per violation:
-          #   - /Artifact spans (no MCID, nothing in the structure tree references
-          #     them): close early (EMC right before the dangerous Q) and reopen
-          #     the same tag right after. No structure-tree change needed.
-          #   - Real tagged spans (carry an MCID that a structure element's /K
-          #     points to): same close/reopen, but the reopened half gets a FRESH
-          #     MCID, and that new (page, MCID) pair is added to the *same*
-          #     structure element's /K list -- so the element still covers all of
-          #     its original content, just as two properly-nested pieces instead
-          #     of one improperly-nested one. Nothing is untagged or dropped.
-          def next_free_mcid(page):
-              """Highest MCID already used on this page's content stream, +1."""
-              hi = -1
-              try:
-                  for inst in pikepdf.parse_content_stream(page):
-                      if str(getattr(inst, 'operator', '')) == 'BDC':
-                          try:
-                              props = inst.operands[1]
-                              if isinstance(props, pikepdf.Dictionary) and '/MCID' in props:
-                                  hi = max(hi, int(props.MCID))
-                          except Exception:
-                              pass
-              except Exception:
-                  pass
-              return hi + 1
-
-
-          def find_struct_elem_for_mcid(struct_roots, page_objgen, mcid):
-              stack = list(struct_roots)
-              while stack:
-                  el = stack.pop()
-                  if not isinstance(el, pikepdf.Dictionary):
-                      continue
-                  k = el.get('/K')
-                  if k is not None:
-                      items = list(k) if isinstance(k, pikepdf.Array) else [k]
-                      pg = el.get('/Pg')
-                      for item in items:
-                          if isinstance(item, int) and pg is not None and \
-                                  pg.objgen == page_objgen and item == mcid:
-                              return el
-                      stack.extend(i for i in items if isinstance(i, pikepdf.Dictionary))
-              return None
-
-
-          def add_mcid_to_struct_elem(el, new_mcid):
-              k = el.get('/K')
-              items = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
-              items.append(new_mcid)
-              el[Name('/K')] = pikepdf.Array(items)
-
-
-          def fix_marked_content_qQ_nesting(pdf):
-              split_count = 0
-              struct_root_kids = []
-              st = pdf.Root.get('/StructTreeRoot')
-              if st is not None:
-                  k = st.get('/K')
-                  struct_root_kids = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
-
-              for page in pdf.pages:
-                  try:
-                      instructions = pikepdf.parse_content_stream(page)
-                  except Exception as exc:
-                      print('  skipping one page (unparseable content stream): %s' % exc)
-                      continue
-
-                  next_mcid = [next_free_mcid(page)]
-                  page_objgen = page.obj.objgen
-
-                  out = []
-                  q_stack = []        # frame ids currently open
-                  frame_counter = [0]
-                  mc_stack = []        # open spans, LIFO (see field docs below)
-                  page_changed = False
-
-                  def reopen_token(tag_name, mcid):
-                      if mcid is None:
-                          return CSI([Name(tag_name)], Operator('BMC'))
-                      return CSI([Name(tag_name), Dictionary(MCID=mcid)], Operator('BDC'))
-
-                  def split_span(span):
-                      nonlocal page_changed
-                      out.append(CSI([], Operator('EMC')))
-                      if span['mcid'] is not None:
-                          new_mcid = next_mcid[0]
-                          next_mcid[0] += 1
-                          el = find_struct_elem_for_mcid(struct_root_kids, page_objgen, span['orig_mcid'])
-                          if el is not None:
-                              add_mcid_to_struct_elem(el, new_mcid)
-                          span['mcid'] = new_mcid
-                      split_count_bump()
-                      page_changed = True
-
-                  def split_count_bump():
-                      nonlocal split_count
-                      split_count += 1
-
-                  for inst in instructions:
-                      op = str(getattr(inst, 'operator', ''))
-                      if op == 'q':
-                          frame_counter[0] += 1
-                          q_stack.append(frame_counter[0])
-                          out.append(inst)
-                      elif op == 'Q':
-                          popped = q_stack.pop() if q_stack else None
-                          # Type 2: a frame that existed BEFORE some open span must
-                          # not close while that span is still open -- split it.
-                          for span in mc_stack:
-                              if not span['done'] and span['boundary_frame'] == popped:
-                                  split_span(span)
-                          out.append(inst)
-                          for span in mc_stack:
-                              if not span['done'] and span['boundary_frame'] == popped:
-                                  out.append(reopen_token(span['tag'], span['mcid']))
-                                  span['boundary_frame'] = q_stack[-1] if q_stack else None
-                                  span['depth_at_open'] = len(q_stack)
-                          # Type 1 resolution: a span whose natural EMC already came
-                          # in too early (still inside a frame it opened after) can
-                          # now be finalized once depth has unwound back to baseline.
-                          for span in mc_stack:
-                              if span['natural_pending'] and not span['done'] and \
-                                      len(q_stack) == span['depth_at_open']:
-                                  out.append(CSI([], Operator('EMC')))
-                                  span['done'] = True
-                          mc_stack[:] = [s for s in mc_stack if not s['done']]
-                      elif op in ('BDC', 'BMC'):
-                          tag = None
-                          mcid = None
-                          try:
-                              tag = str(inst.operands[0])
-                              if len(inst.operands) > 1 and isinstance(inst.operands[1], pikepdf.Dictionary) \
-                                      and '/MCID' in inst.operands[1]:
-                                  mcid = int(inst.operands[1].MCID)
-                          except Exception:
-                              pass
-                          mc_stack.append({
-                              'boundary_frame': q_stack[-1] if q_stack else None,
-                              'depth_at_open': len(q_stack),
-                              'tag': tag, 'mcid': mcid, 'orig_mcid': mcid,
-                              'natural_pending': False, 'done': False,
-                          })
-                          out.append(inst)
-                      elif op == 'EMC':
-                          if mc_stack:
-                              span = mc_stack[-1]
-                              if len(q_stack) == span['depth_at_open']:
-                                  out.append(inst)
-                                  span['done'] = True
-                                  mc_stack.pop()
-                              else:
-                                  # Type 1: still inside a frame opened after this
-                                  # span began -- defer the real close until that
-                                  # frame unwinds (handled in the 'Q' branch).
-                                  span['natural_pending'] = True
-                                  split_count_bump()
-                                  page_changed = True
-                          else:
-                              out.append(inst)
-                      else:
-                          out.append(inst)
-
-                  if page_changed:
-                      page.Contents = pdf.make_indirect(pikepdf.Stream(
-                          pdf, pikepdf.unparse_content_stream(out)))
-              return split_count
-
-
           # ---------- 0. whitespace-only leaf marked-content spans ----------
           #
           # "Tagged text consists only of whitespace / its location can only be
@@ -805,9 +630,6 @@ jobs:
 
           def main(path, title):
               with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-                  mc = fix_marked_content_qQ_nesting(pdf)
-                  print('fix_pdf_pdfua: split %d marked-content spans that crossed a '
-                        'q/Q boundary into properly-nested pieces.' % mc)
                   ws = artifact_whitespace_spans(pdf)
                   print('fix_pdf_pdfua: retagged %d whitespace-only leaf spans as '
                         'artifacts.' % ws)
@@ -873,7 +695,7 @@ jobs:
             catalog.pptx
           test -s catalog.pdf || (echo "LibreOffice conversion failed -- see log above." && exit 1)
 
-      - name: Post-process PDF for PDF/UA (q/Q nesting, artifacts, sections, H1, metadata)
+      - name: Post-process PDF for PDF/UA (artifacts, sections, H1, metadata)
         run: python3 fix_pdf_pdfua.py catalog.pdf "Tree Catalog"
 
       - name: Send PDF back to Apps Script
