@@ -391,6 +391,109 @@ jobs:
               el[Name('/K')] = pikepdf.Array(items)
 
 
+          # ---------- 0-pre. real content physically nested inside an artifact ----------
+          #
+          # LibreOffice opens ONE background /Artifact span near the top of
+          # each page's content stream (the page background graphic) and does
+          # not close it again until the very end of the page -- confirmed
+          # directly against this document by walking the raw BDC/BMC/EMC
+          # sequence: virtually every real, correctly-tagged MCID span on
+          # every page (the title, "Notable Features", description,
+          # dimensions, the link -- everything) sits physically INSIDE that
+          # one open Artifact block. That's a straightforward PDF/UA
+          # violation -- tagged content shall not be a descendant of an
+          # Artifact -- independent of whatever the structure tree itself
+          # says, and it's the single largest source of "Content" failures in
+          # this document (nearly one per MCID, on every page).
+          #
+          # This is NOT a q/Q-crossing problem, so fix_marked_content_qQ_nesting
+          # never touches it: that fix only triggers when an open span's
+          # ENCLOSING graphics-state frame closes out from under it, and this
+          # artifact is opened at the top level (no enclosing q), so no Q
+          # instruction ever "pops" a frame it's watching. It just never gets
+          # closed until the page is done -- a different failure mode
+          # entirely, needing its own pass -- run LAST among content-stream
+          # passes (see main()), since the q/Q fix reopening one of ITS OWN
+          # spans across a boundary can re-extend an Artifact's lifetime back
+          # over real content, and nothing should run after this one that
+          # could undo its careful close-before-real/reopen-after boundaries.
+          #
+          # Fix: whenever a real (structure-tagged) BDC is about to open
+          # while one or more Artifact spans are currently open, close every
+          # open Artifact first (innermost to outermost), let the real
+          # content open and close completely normally and untouched
+          # (including any of its own nested real children), then reopen the
+          # same Artifact span(s) in the same original order immediately
+          # afterward. This is the same close/reopen-with-a-fresh-instance
+          # pattern already proven for q/Q splitting below, just triggered by
+          # "real content wants to open" instead of "a Q instruction popped
+          # an enclosing frame". Artifacts don't carry MCIDs, so unlike the
+          # q/Q and whitespace fixes there's no structure-tree bookkeeping
+          # needed here at all -- purely a content-stream reshaping.
+          def fix_real_content_inside_artifact(pdf):
+              changed = 0
+              for page in pdf.pages:
+                  try:
+                      instructions = pikepdf.parse_content_stream(page)
+                  except Exception as exc:
+                      print('  skipping one page (unparseable content stream): %s' % exc)
+                      continue
+
+                  out = []
+                  stack = []  # each: {'kind': 'artifact'|'real'|'other', 'tag': str, 'reopen': list|None}
+                  page_changed = False
+
+                  for inst in instructions:
+                      op = str(getattr(inst, 'operator', ''))
+                      if op in ('BDC', 'BMC'):
+                          tag = None
+                          is_real = False
+                          is_artifact = False
+                          try:
+                              tag = str(inst.operands[0])
+                              if tag == '/Artifact':
+                                  is_artifact = True
+                              elif op == 'BDC' and len(inst.operands) > 1 and \
+                                      isinstance(inst.operands[1], pikepdf.Dictionary) and \
+                                      '/MCID' in inst.operands[1]:
+                                  is_real = True
+                          except Exception:
+                              pass
+
+                          pending_reopen = None
+                          if is_real:
+                              closed_innermost_first = []
+                              while stack and stack[-1]['kind'] == 'artifact':
+                                  out.append(CSI([], Operator('EMC')))
+                                  closed_innermost_first.append(stack.pop()['tag'])
+                                  changed += 1
+                                  page_changed = True
+                              if closed_innermost_first:
+                                  # reopen outermost-first to restore original nesting
+                                  pending_reopen = list(reversed(closed_innermost_first))
+
+                          out.append(inst)
+                          stack.append({
+                              'kind': 'artifact' if is_artifact else ('real' if is_real else 'other'),
+                              'tag': tag, 'reopen': pending_reopen,
+                          })
+                      elif op == 'EMC':
+                          out.append(inst)
+                          if stack:
+                              closed = stack.pop()
+                              if closed['reopen']:
+                                  for t in closed['reopen']:
+                                      out.append(CSI([Name(t)], Operator('BMC')))
+                                      stack.append({'kind': 'artifact', 'tag': t, 'reopen': None})
+                      else:
+                          out.append(inst)
+
+                  if page_changed:
+                      page.Contents = pdf.make_indirect(pikepdf.Stream(
+                          pdf, pikepdf.unparse_content_stream(out)))
+              return changed
+
+
           def fix_marked_content_qQ_nesting(pdf):
               split_count = 0
               struct_root_kids = []
@@ -1045,6 +1148,115 @@ jobs:
               return fixed
 
 
+          # ---------- 3a-post. accessible-text expansions ----------
+          #
+          # Some card badges are short visual abbreviations -- "ST" for a
+          # salt-tolerant tree, matched against this document's own Key page
+          # ("Salt Tolerant", paired with the same triangle icon that appears
+          # on every card carrying the "ST" badge). A screen reader spelling
+          # out bare letters conveys nothing; a sighted reader benefits from
+          # the compact badge staying compact. PDF's /ActualText on a
+          # structure element is exactly the tool for this: assistive
+          # technology announces the /ActualText string INSTEAD of the
+          # rendered glyphs, while sighted rendering is completely untouched
+          # (nothing about how the badge is drawn changes).
+          #
+          # EXPANSIONS is intentionally a single small table: add a
+          # lowercased key (the exact, whole, trimmed text of the badge as
+          # it appears on its own -- this only matches a leaf element whose
+          # ENTIRE text is exactly that key, never a substring of a longer
+          # sentence) mapped to what a screen reader should say instead.
+          EXPANSIONS = {
+              # 'st' pairs with the salt-tolerant (triangle) icon on this
+              # document's own Key page -- double check this is the wording
+              # you want; it's a one-line edit if not.
+              'st': 'Salt Tolerant',
+          }
+
+
+          def add_actual_text_expansions(pdf, expansions):
+              st = pdf.Root.get('/StructTreeRoot')
+              if st is None:
+                  return 0
+              fixed = 0
+              page_by_objgen = {p.obj.objgen: p for p in pdf.pages}
+              text_cache = {}
+
+              def texts_for(page_objgen):
+                  if page_objgen in text_cache:
+                      return text_cache[page_objgen]
+                  page = page_by_objgen.get(page_objgen)
+                  raw = {}
+                  if page is not None:
+                      try:
+                          decoders = build_font_decoders(page)
+                          mcid_stack = []
+                          cur_font = None
+                          for inst in pikepdf.parse_content_stream(page):
+                              op = str(getattr(inst, 'operator', ''))
+                              if op == 'BDC':
+                                  props = inst.operands[1] if len(inst.operands) > 1 else None
+                                  mcid = int(props.MCID) if isinstance(props, pikepdf.Dictionary) \
+                                      and '/MCID' in props else None
+                                  mcid_stack.append(mcid)
+                              elif op == 'BMC':
+                                  mcid_stack.append(None)
+                              elif op == 'EMC':
+                                  if mcid_stack:
+                                      mcid_stack.pop()
+                              elif op == 'Tf':
+                                  try:
+                                      cur_font = str(inst.operands[0])
+                                  except Exception:
+                                      cur_font = None
+                              elif op in TEXT_SHOW_OPS:
+                                  if mcid_stack and mcid_stack[-1] is not None:
+                                      width, mapping = decoders.get(cur_font, (1, {}))
+                                      raw.setdefault(mcid_stack[-1], []).append(
+                                          decode_pdf_string(bytes(inst.operands[-1]), width, mapping))
+                              elif op == 'TJ':
+                                  if mcid_stack and mcid_stack[-1] is not None:
+                                      width, mapping = decoders.get(cur_font, (1, {}))
+                                      parts = []
+                                      for item in inst.operands[0]:
+                                          if isinstance(item, (bytes, pikepdf.String)):
+                                              parts.append(decode_pdf_string(bytes(item), width, mapping))
+                                      raw.setdefault(mcid_stack[-1], []).append(''.join(parts))
+                      except Exception as exc:
+                          print('  actual-text: skipping one page (unparseable): %s' % exc)
+                  texts = {k: ''.join(v) for k, v in raw.items()}
+                  text_cache[page_objgen] = texts
+                  return texts
+
+              def walk(el, cur_page=None):
+                  nonlocal fixed
+                  my_page = el.get('/Pg', cur_page)
+                  kids = struct_children(el)
+                  struct_kids = [c for c in kids if isinstance(c, pikepdf.Dictionary) and '/S' in c]
+                  mcid_kids = [c for c in kids if isinstance(c, int)]
+                  # only a LEAF element (no nested structure, just its own
+                  # direct MCID text) is safe to match whole-text -- avoids
+                  # ever matching a badge that happens to sit near other text
+                  # under a shared container.
+                  if mcid_kids and not struct_kids:
+                      pg = el.get('/Pg', my_page)
+                      if pg is not None:
+                          texts = texts_for(pg.objgen)
+                          combined = ''.join(texts.get(m, '') for m in mcid_kids).strip()
+                          expansion = expansions.get(combined.lower())
+                          if expansion:
+                              el[Name('/ActualText')] = pikepdf.String(expansion)
+                              fixed += 1
+                  for c in struct_kids:
+                      walk(c, my_page)
+
+              for k in struct_children(st):
+                  if isinstance(k, pikepdf.Dictionary):
+                      walk(k)
+
+              return fixed
+
+
           # ---------- 3a. structural parent tree (ISO 32000-1) ----------
           #
           # A structure element's /K array is the tree walked top-down for
@@ -1212,11 +1424,24 @@ jobs:
                         'artifacts.' % ws)
                   n = artifact_untagged_paths(pdf)
                   print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
+                  # LAST among content-stream passes, deliberately: q/Q splitting
+                  # above can reopen one of ITS OWN spans across a q/Q boundary,
+                  # and if that happened to re-extend an Artifact's lifetime back
+                  # over real content, anything running after this fix would risk
+                  # undoing it. Running this fix last means nothing touches
+                  # BDC/BMC/EMC afterward to interfere with its careful
+                  # close-before-real/reopen-after boundaries.
+                  ra = fix_real_content_inside_artifact(pdf)
+                  print('fix_pdf_pdfua: un-nested %d real content span(s) from inside '
+                        'an open Artifact block.' % ra)
                   print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
                   print('fix_pdf_pdfua: headings: %s.' % ensure_heading(pdf))
                   fw = fix_figure_wrapping_real_content(pdf)
                   print('fix_pdf_pdfua: re-tagged %d /Figure element(s) that were '
                         'wrapping real text content to /Div.' % fw)
+                  at = add_actual_text_expansions(pdf, EXPANSIONS)
+                  print('fix_pdf_pdfua: added %d screen-reader text expansion(s) '
+                        '(e.g. "ST" -> "Salt Tolerant").' % at)
                   print('fix_pdf_pdfua: parent tree: %s.' % rebuild_parent_tree(pdf))
                   fix_metadata(pdf, title)
                   pdf.save(path)
