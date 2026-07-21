@@ -997,6 +997,54 @@ jobs:
               return 'no /P element found to promote'
 
 
+          # ---------- 3a-pre. /Figure elements wrapping real content ----------
+          #
+          # /Figure represents ONE graphical object; its /Alt substitutes for
+          # everything inside it to assistive technology, which treats a
+          # Figure carrying /Alt as opaque -- it announces the Alt text and
+          # does not descend into or announce any children. In this document,
+          # each card's whole group (title, "Notable Features", description,
+          # dimensions, longevity, growth rate, and the "More info" link) is
+          # tagged as a single /Figure with generic Alt "Decorative graphic.",
+          # which silences every real paragraph inside it. A screen reader
+          # hits that Figure, reads "Decorative graphic.", and moves on --
+          # never touching the card's actual text. The separate, genuinely
+          # leaf Figures for the photo and each icon (no structural children,
+          # specific Alt text) are unaffected and read correctly, which is
+          # why only images/icons and the footer come through. Confirmed
+          # directly against this document's structure tree: exactly the
+          # elements with nested /P and /Link children carry this generic
+          # Alt; every true single-image Figure has zero structural children.
+          # Fix: re-tag any /Figure that has structural (non-leaf-MCID)
+          # children to /Div -- a plain, transparent grouping role assistive
+          # technology descends into normally -- and drop its now-meaningless
+          # /Alt. True leaf figures (an actual photo or icon) are left
+          # completely alone.
+          def fix_figure_wrapping_real_content(pdf):
+              st = pdf.Root.get('/StructTreeRoot')
+              if st is None:
+                  return 0
+              fixed = 0
+
+              def walk(el):
+                  nonlocal fixed
+                  kids = struct_children(el)
+                  struct_kids = [c for c in kids if isinstance(c, pikepdf.Dictionary) and '/S' in c]
+                  if str(el.get('/S')) == '/Figure' and struct_kids:
+                      el[Name('/S')] = Name('/Div')
+                      if '/Alt' in el:
+                          del el[Name('/Alt')]
+                      fixed += 1
+                  for c in struct_kids:
+                      walk(c)
+
+              for k in struct_children(st):
+                  if isinstance(k, pikepdf.Dictionary):
+                      walk(k)
+
+              return fixed
+
+
           # ---------- 3a. structural parent tree (ISO 32000-1) ----------
           #
           # A structure element's /K array is the tree walked top-down for
@@ -1166,6 +1214,9 @@ jobs:
                   print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
                   print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
                   print('fix_pdf_pdfua: headings: %s.' % ensure_heading(pdf))
+                  fw = fix_figure_wrapping_real_content(pdf)
+                  print('fix_pdf_pdfua: re-tagged %d /Figure element(s) that were '
+                        'wrapping real text content to /Div.' % fw)
                   print('fix_pdf_pdfua: parent tree: %s.' % rebuild_parent_tree(pdf))
                   fix_metadata(pdf, title)
                   pdf.save(path)
