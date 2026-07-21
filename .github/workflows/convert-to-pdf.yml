@@ -742,6 +742,136 @@ jobs:
               return fixed
 
 
+          # ---------- 0a-post. link text color ----------
+          #
+          # The "More info" label is drawn with an explicit nonstroking-color
+          # operator (confirmed directly against this document: `0 0.592
+          # 0.655 rg` right before the text, in a q/Q block scoped to just
+          # this run -- not shared with any other text) that renders as a
+          # blue too light to meet contrast against the white card
+          # background. That color is set upstream, in the deck itself,
+          # which is the right place to fix it going forward -- but this
+          # guarantees it in the actual PDF regardless of what produced it,
+          # the same way the other fixes in this script don't depend on
+          # trusting an upstream step got it right. Finds the same "More" /
+          # "info" / "More info" marked-content spans link_structure_elements
+          # already locates, then overwrites the ACTIVE nonstroking-color
+          # instruction at the moment each span's text is drawn (rg/g/k, or
+          # sc/scn when every operand is a plain number -- a pattern fill is
+          # left alone rather than guessed at) with solid black. Nothing
+          # about which glyphs are drawn, their position, or the marked
+          # content structure changes -- only the color operands.
+          def force_link_text_color_black(pdf, pattern):
+              changed = 0
+              COLOR_OPS = ('rg', 'g', 'k', 'sc', 'scn')
+              for page in pdf.pages:
+                  try:
+                      instructions = pikepdf.parse_content_stream(page)
+                  except Exception as exc:
+                      print('  skipping one page (unparseable content stream): %s' % exc)
+                      continue
+
+                  decoders = build_font_decoders(page)
+
+                  # pass 1: decode text per mcid, to find which mcids are link labels
+                  texts = {}
+                  mcid_stack = []
+                  cur_font = None
+                  for inst in instructions:
+                      op = str(getattr(inst, 'operator', ''))
+                      if op == 'BDC':
+                          props = inst.operands[1] if len(inst.operands) > 1 else None
+                          mcid = int(props.MCID) if isinstance(props, pikepdf.Dictionary) \
+                              and '/MCID' in props else None
+                          mcid_stack.append(mcid)
+                      elif op == 'BMC':
+                          mcid_stack.append(None)
+                      elif op == 'EMC':
+                          if mcid_stack:
+                              mcid_stack.pop()
+                      elif op == 'Tf':
+                          try:
+                              cur_font = str(inst.operands[0])
+                          except Exception:
+                              cur_font = None
+                      elif op in TEXT_SHOW_OPS:
+                          if mcid_stack and mcid_stack[-1] is not None:
+                              width, mapping = decoders.get(cur_font, (1, {}))
+                              texts.setdefault(mcid_stack[-1], []).append(
+                                  decode_pdf_string(bytes(inst.operands[-1]), width, mapping))
+                      elif op == 'TJ':
+                          if mcid_stack and mcid_stack[-1] is not None:
+                              width, mapping = decoders.get(cur_font, (1, {}))
+                              parts = []
+                              for item in inst.operands[0]:
+                                  if isinstance(item, (bytes, pikepdf.String)):
+                                      parts.append(decode_pdf_string(bytes(item), width, mapping))
+                              texts.setdefault(mcid_stack[-1], []).append(''.join(parts))
+                  texts = {k: ''.join(v) for k, v in texts.items()}
+                  link_mcids = {m for m, t in texts.items() if pattern.match(t.strip())}
+                  if not link_mcids:
+                      continue
+
+                  # pass 2: track the ACTIVE color instruction as we go; whenever a
+                  # link mcid's text is drawn, mark that instruction for patching.
+                  last_color_idx = None
+                  to_patch = set()
+                  mcid_stack = []
+                  for idx, inst in enumerate(instructions):
+                      op = str(getattr(inst, 'operator', ''))
+                      if op in COLOR_OPS:
+                          last_color_idx = idx
+                      if op == 'BDC':
+                          props = inst.operands[1] if len(inst.operands) > 1 else None
+                          mcid = int(props.MCID) if isinstance(props, pikepdf.Dictionary) \
+                              and '/MCID' in props else None
+                          mcid_stack.append(mcid)
+                      elif op == 'BMC':
+                          mcid_stack.append(None)
+                      elif op == 'EMC':
+                          if mcid_stack:
+                              mcid_stack.pop()
+                      elif (op in TEXT_SHOW_OPS or op == 'TJ') and last_color_idx is not None:
+                          if mcid_stack and mcid_stack[-1] in link_mcids:
+                              to_patch.add(last_color_idx)
+
+                  if not to_patch:
+                      continue
+
+                  out = []
+                  page_changed = False
+                  for idx, inst in enumerate(instructions):
+                      op = str(getattr(inst, 'operator', ''))
+                      if idx in to_patch:
+                          if op == 'rg':
+                              out.append(CSI([0, 0, 0], Operator('rg')))
+                          elif op == 'g':
+                              out.append(CSI([0], Operator('g')))
+                          elif op == 'k':
+                              out.append(CSI([0, 0, 0, 1], Operator('k')))
+                          elif op in ('sc', 'scn') and all(not isinstance(o, pikepdf.Name) for o in inst.operands):
+                              n_ops = len(inst.operands)
+                              if n_ops == 1:
+                                  out.append(CSI([0], Operator(op)))
+                              elif n_ops == 3:
+                                  out.append(CSI([0, 0, 0], Operator(op)))
+                              elif n_ops == 4:
+                                  out.append(CSI([0, 0, 0, 1], Operator(op)))
+                              else:
+                                  out.append(inst)  # unrecognized shape: leave alone
+                          else:
+                              out.append(inst)  # pattern fill (has a Name operand): leave alone
+                          page_changed = True
+                          changed += 1
+                      else:
+                          out.append(inst)
+
+                  if page_changed:
+                      page.Contents = pdf.make_indirect(pikepdf.Stream(
+                          pdf, pikepdf.unparse_content_stream(out)))
+              return changed
+
+
           # ---------- 0. whitespace-only leaf marked-content spans ----------
           #
           # "Tagged text consists only of whitespace / its location can only be
@@ -1419,6 +1549,9 @@ jobs:
                   lk = link_structure_elements(pdf, LINK_TEXT_PATTERN)
                   print('fix_pdf_pdfua: nested %d link annotation(s) inside a /Link '
                         'structure element.' % lk)
+                  lc = force_link_text_color_black(pdf, LINK_TEXT_PATTERN)
+                  print('fix_pdf_pdfua: forced %d link-text color instruction(s) to '
+                        'solid black.' % lc)
                   ws = artifact_whitespace_spans(pdf)
                   print('fix_pdf_pdfua: retagged %d whitespace-only leaf spans as '
                         'artifacts.' % ws)
