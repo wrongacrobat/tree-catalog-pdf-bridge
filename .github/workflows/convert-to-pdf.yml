@@ -521,6 +521,21 @@ jobs:
           # pointing at the actual annotation so AT can both read and activate it.
           # Matches by TEXT rather than position because the label is short,
           # fixed, and unique enough on the page not to need geometry.
+          #
+          # BUGFIX: a wrapped label produces TWO matching structure elements
+          # ("More" and "info" as separate /P's) for ONE annotation. The old code
+          # paired `matches` 1:1 with `link_annots` via zip() -- a single wrapped
+          # link consumed two slots, which silently shifted every later pairing
+          # on that page out of alignment and left a trailing real link on the
+          # page completely unfixed ("link annotation is not nested inside a
+          # link structure element" persisting for that link). Fix: first
+          # collapse adjacent "more" + "info" fragments into one GROUP per real
+          # link, so len(groups) == number of logical links regardless of
+          # wrapping, then pair groups with annotations 1:1. Every element in a
+          # group is tagged /Link with its own /OBJR pointing at the same
+          # annotation -- two structure elements sharing one annotation via OBJR
+          # is valid, ordinary tagged-PDF practice for a link whose visible text
+          # is split across a line break.
           LINK_TEXT_PATTERN = re.compile(r'^(more|info|more\s+info)\.?$', re.IGNORECASE)
 
           def link_structure_elements(pdf, pattern):
@@ -570,7 +585,7 @@ jobs:
                               texts.setdefault(mcid_stack[-1], []).append(''.join(parts))
                   texts = {k: ''.join(v) for k, v in texts.items()}
 
-                  matches = []
+                  matches = []  # in document/reading order: {'el', 'text'}
                   seen_ids = set()
 
                   def walk(el, cur_page=None):
@@ -581,7 +596,10 @@ jobs:
                                   t = texts.get(c, '').strip()
                                   if pattern.match(t) and str(el.get('/S')) != '/Link' and id(el) not in seen_ids:
                                       seen_ids.add(id(el))
-                                      matches.append(el)
+                                      matches.append({
+                                          'el': el,
+                                          'text': t.lower().rstrip('.').strip(),
+                                      })
                           elif isinstance(c, pikepdf.Dictionary) and '/S' in c:
                               c_page = c.get('/Pg', my_page)
                               if c_page is not None and c_page.objgen != page_objgen:
@@ -592,12 +610,30 @@ jobs:
                       if isinstance(k, pikepdf.Dictionary):
                           walk(k)
 
-                  for el, annot in zip(matches, link_annots):
-                      el[Name('/S')] = Name('/Link')
-                      k = el.get('/K')
-                      items = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
-                      items.append(Dictionary(Type=Name('/OBJR'), Obj=annot))
-                      el[Name('/K')] = pikepdf.Array(items)
+                  # Collapse a "more" immediately followed by "info" (the
+                  # line-wrapped case) into one group of two elements; a
+                  # standalone "more info" is its own group of one. A stray
+                  # "info" with no preceding "more" (shouldn't normally happen)
+                  # is still kept as its own group so it gets linked rather than
+                  # silently dropped.
+                  groups = []
+                  i = 0
+                  while i < len(matches):
+                      cur = matches[i]
+                      if cur['text'] == 'more' and i + 1 < len(matches) and matches[i + 1]['text'] == 'info':
+                          groups.append([cur['el'], matches[i + 1]['el']])
+                          i += 2
+                      else:
+                          groups.append([cur['el']])
+                          i += 1
+
+                  for group, annot in zip(groups, link_annots):
+                      for el in group:
+                          el[Name('/S')] = Name('/Link')
+                          k = el.get('/K')
+                          items = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
+                          items.append(Dictionary(Type=Name('/OBJR'), Obj=annot))
+                          el[Name('/K')] = pikepdf.Array(items)
                       fixed += 1
 
               return fixed
@@ -615,8 +651,77 @@ jobs:
           # Tj/TJ text is non-empty and 100% whitespace, retag it BMC /Artifact
           # instead of BDC /Tag <<...>>. Nested spans, and spans containing any
           # real text, are left completely alone.
+          #
+          # BUGFIX: retagging the content-stream span to /Artifact used to be the
+          # WHOLE fix -- but the structure element that had this MCID in its /K
+          # list was never told the content moved. The tree kept pointing at an
+          # MCID that no longer exists as tagged content on the page. That is
+          # exactly PAC's "MCID missing" failure, and, read from the content-
+          # stream side (a marked-content sequence tagged /Artifact whose MCID is
+          # STILL claimed by a structure element), the very same defect is what
+          # PAC reports as "tagged content is present inside an artifact" -- two
+          # different names for one dangling reference. Fix: whenever a span is
+          # converted, remove that MCID from the structure element that owned it,
+          # and if that empties the element's /K, remove the now-childless
+          # element from ITS parent in turn (recursively) so no empty structure
+          # element is left behind either (that shows up separately as a
+          # "structure element has no content" failure).
+          def _prune_mcid(node, page_objgen, mcid):
+              """Remove a leaf MCID entry for `mcid` on `page_objgen` from
+              anywhere under `node`. Returns True if `node` itself is left with
+              an empty /K as a result, signalling the CALLER to drop `node` from
+              its own /K too (cascading the prune upward)."""
+              k = node.get('/K')
+              if k is None:
+                  return False
+              items = list(k) if isinstance(k, pikepdf.Array) else [k]
+              pg = node.get('/Pg')
+              out_items = []
+              found = False
+              for item in items:
+                  if isinstance(item, int):
+                      if (not found) and item == mcid and pg is not None and pg.objgen == page_objgen:
+                          found = True
+                          continue  # drop this MCID reference
+                      out_items.append(item)
+                  elif isinstance(item, pikepdf.Dictionary) and '/S' in item:
+                      if _prune_mcid(item, page_objgen, mcid):
+                          found = True
+                          continue  # child is now empty: drop the child entirely
+                      out_items.append(item)
+                  else:
+                      out_items.append(item)
+              if not found:
+                  return False
+              if out_items:
+                  node[Name('/K')] = pikepdf.Array(out_items) if len(out_items) > 1 else out_items[0]
+                  return False
+              del node[Name('/K')]
+              return True  # node is now childless: caller should drop it
+
+
+          def remove_mcid_from_structure(pdf, page_objgen, mcid):
+              st = pdf.Root.get('/StructTreeRoot')
+              if st is None:
+                  return False
+              kids = struct_children(st)
+              kept = []
+              changed = False
+              for k in kids:
+                  if isinstance(k, pikepdf.Dictionary) and '/S' in k:
+                      if _prune_mcid(k, page_objgen, mcid):
+                          changed = True
+                          continue  # root element now empty: drop it
+                  kept.append(k)
+              if changed:
+                  st[Name('/K')] = pikepdf.Array(kept) if len(kept) != 1 else \
+                      (kept[0] if kept else pikepdf.Array([]))
+              return changed
+
+
           def artifact_whitespace_spans(pdf):
               changed = 0
+              st_present = pdf.Root.get('/StructTreeRoot') is not None
               for page in pdf.pages:
                   try:
                       instructions = pikepdf.parse_content_stream(page)
@@ -626,8 +731,9 @@ jobs:
                   font_decoders = build_font_decoders(page)
                   cur_font = None
                   n = len(instructions)
-                  stack = []   # each: {'start': idx, 'texts': [], 'nested': False}
-                  convert = {}  # start_idx -> True (retag), populated as spans close
+                  page_objgen = page.obj.objgen
+                  stack = []   # each: {'start': idx, 'texts': [], 'nested': False, 'mcid': int|None}
+                  convert = {}  # start_idx -> mcid_or_None, populated as spans close
                   page_changed = False
 
                   for idx in range(n):
@@ -641,7 +747,15 @@ jobs:
                       elif op in ('BDC', 'BMC'):
                           if stack:
                               stack[-1]['nested'] = True
-                          stack.append({'start': idx, 'texts': [], 'nested': False})
+                          mcid = None
+                          if op == 'BDC':
+                              try:
+                                  props = inst.operands[1]
+                                  if isinstance(props, pikepdf.Dictionary) and '/MCID' in props:
+                                      mcid = int(props.MCID)
+                              except Exception:
+                                  pass
+                          stack.append({'start': idx, 'texts': [], 'nested': False, 'mcid': mcid})
                       elif op == 'EMC':
                           if not stack:
                               continue
@@ -650,7 +764,7 @@ jobs:
                               text = ''.join(span['texts'])
                               if text and '\ufffd' not in text and \
                                       all(c in WHITESPACE_CHARS for c in text):
-                                  convert[span['start']] = True
+                                  convert[span['start']] = span['mcid']
                       elif op in TEXT_SHOW_OPS and stack:
                           width, mapping = font_decoders.get(cur_font, (0, None))
                           if mapping is not None:
@@ -684,6 +798,9 @@ jobs:
                           out.append(CSI([Name('/Artifact')], Operator('BMC')))
                           page_changed = True
                           changed += 1
+                          mcid = convert[idx]
+                          if mcid is not None and st_present:
+                              remove_mcid_from_structure(pdf, page_objgen, mcid)
                       else:
                           out.append(inst)
 
