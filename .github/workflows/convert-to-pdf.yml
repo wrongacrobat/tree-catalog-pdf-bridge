@@ -1001,33 +1001,47 @@ jobs:
           #
           # A structure element's /K array is the tree walked top-down for
           # reading order: page -> card -> "Notable Features". PDF/UA also
-          # requires the reverse map, StructTreeRoot/ParentTree: keyed by each
-          # page's /StructParents integer, an array indexed by MCID pointing
-          # back to the structure element that owns it. Nothing earlier in
-          # this script maintained that map -- splitting a span at a q/Q
-          # boundary mints a brand-new MCID and adds it to a structure
-          # element's /K (fix_marked_content_qQ_nesting), and retiring a
-          # whitespace span removes an MCID from /K (artifact_whitespace_spans),
-          # but neither told ParentTree the array for that page needed to grow
-          # or shrink. The /K side of the tree ends up completely correct --
-          # confirmed by walking it directly, every card's title, "Notable
-          # Features" label, description, dimensions, and growth stats are
-          # all present and in order -- but a reader that resolves content the
-          # OTHER way (page + MCID -> ParentTree -> structure element, which is
-          # how a reading-order view is commonly built) hits a ParentTree array
-          # that's too short and can give up on that page, or on the document,
-          # before it ever gets to displaying the text. Rather than trying to
-          # track every place upstream that mints or retires an MCID, this
-          # rebuilds ParentTree from scratch as the LAST step, straight from
-          # whatever the structure tree and content streams actually contain
-          # by the time every other fix has run -- so it's correct regardless
-          # of which earlier step (or a future one) changed what.
+          # requires the reverse map, StructTreeRoot/ParentTree, and it has TWO
+          # separate uses that are easy to only half-implement:
+          #   1. Per page: keyed by the page's /StructParents integer, an
+          #      array indexed by MCID, pointing back to the structure element
+          #      that owns each piece of marked content.
+          #   2. Per non-content object referenced via /OBJR (an annotation,
+          #      here every "More info" /Link) -- keyed by an integer stored
+          #      on the OBJECT ITSELF as /StructParent (singular), pointing
+          #      DIRECTLY at the one structure element that references it.
+          #      This is the mirror of the /OBJR we already add: /OBJR lets a
+          #      reader go structure-element -> annotation; /StructParent lets
+          #      it go annotation -> structure element. A checker validating
+          #      "is this link properly tagged" typically checks BOTH
+          #      directions, and this document had the first but never the
+          #      second -- all 8 Link annotations were missing /StructParent
+          #      entirely, which is its own ISO 32000-1 structural-parent-tree
+          #      failure independent of the per-page array being complete.
+          # Nothing earlier in this script maintained either of these --
+          # splitting a span at a q/Q boundary mints a brand-new MCID and adds
+          # it to a structure element's /K (fix_marked_content_qQ_nesting),
+          # retiring a whitespace span removes an MCID from /K
+          # (artifact_whitespace_spans), and tagging a link adds an /OBJR
+          # (link_structure_elements) -- but none of them touched ParentTree.
+          # The /K side of the tree ends up completely correct -- confirmed by
+          # walking it directly, every card's title, "Notable Features" label,
+          # description, dimensions, and growth stats are all present and in
+          # order -- but a reader/checker that resolves content the OTHER way
+          # (page + MCID, or annotation, -> ParentTree -> structure element)
+          # hits gaps and can give up well before it ever gets to displaying
+          # or validating the text. Rather than trying to track every place
+          # upstream that mints an MCID or an OBJR, this rebuilds ParentTree
+          # from scratch as the LAST step, straight from whatever the
+          # structure tree, content streams, and annotations actually contain
+          # by the time every other fix has run.
           def rebuild_parent_tree(pdf):
               st = pdf.Root.get('/StructTreeRoot')
               if st is None:
                   return 'no structure tree, nothing to rebuild'
 
               owner_by_page_mcid = {}  # (page_objgen, mcid) -> owning struct elem
+              objr_owner = {}          # annotation objgen -> (annot_obj, owning struct elem)
 
               def walk(el, cur_page=None):
                   my_page = el.get('/Pg', cur_page)
@@ -1036,14 +1050,24 @@ jobs:
                           pg = el.get('/Pg', my_page)
                           if pg is not None:
                               owner_by_page_mcid[(pg.objgen, c)] = el
-                      elif isinstance(c, pikepdf.Dictionary) and '/S' in c:
-                          walk(c, my_page)
+                      elif isinstance(c, pikepdf.Dictionary):
+                          if c.get('/Type') == Name('/OBJR') and '/Obj' in c:
+                              try:
+                                  annot = c['/Obj']
+                                  key = annot.objgen
+                                  if key not in objr_owner:
+                                      objr_owner[key] = (annot, el)
+                              except Exception:
+                                  pass
+                          elif '/S' in c:
+                              walk(c, my_page)
 
               for k in struct_children(st):
                   if isinstance(k, pikepdf.Dictionary):
                       walk(k)
 
               entries = []
+              used_keys = set()
               for page in pdf.pages:
                   sp = page.obj.get('/StructParents')
                   if sp is None:
@@ -1063,16 +1087,38 @@ jobs:
                       print('  ParentTree rebuild: skipping one page (unparseable '
                             'content stream): %s' % exc)
                       continue
+                  used_keys.add(int(sp))
                   if max_mcid < 0:
                       continue  # page has no tagged content at all: no entry needed
                   arr = [owner_by_page_mcid.get((page_objgen, i)) for i in range(max_mcid + 1)]
                   entries.append((int(sp), pdf.make_indirect(pikepdf.Array(arr))))
 
+              # Annotation entries share the SAME ParentTree key space as page
+              # entries, so any key handed out here has to avoid every
+              # /StructParents value already claimed above. Reuse an
+              # annotation's existing /StructParent only if it's actually
+              # free; otherwise mint a fresh one past the highest key in use.
+              next_key = (max(used_keys) + 1) if used_keys else 0
+              annot_count = 0
+              for annot, el in objr_owner.values():
+                  try:
+                      existing = annot.get('/StructParent')
+                      key = int(existing) if existing is not None and int(existing) not in used_keys else None
+                      if key is None:
+                          key = next_key
+                          next_key += 1
+                      used_keys.add(key)
+                      annot[Name('/StructParent')] = key
+                      entries.append((key, el))
+                      annot_count += 1
+                  except Exception as exc:
+                      print('  ParentTree rebuild: skipping one annotation: %s' % exc)
+
               entries.sort(key=lambda e: e[0])
               nums = []
-              for key, arr in entries:
+              for key, val in entries:
                   nums.append(key)
-                  nums.append(arr)
+                  nums.append(val)
 
               if '/ParentTree' in st:
                   pt = st['/ParentTree']
@@ -1082,7 +1128,8 @@ jobs:
               else:
                   st[Name('/ParentTree')] = pdf.make_indirect(Dictionary(Nums=pikepdf.Array(nums)))
 
-              return 'rebuilt for %d page(s)' % len(entries)
+              return 'rebuilt (%d page entries, %d annotation entries)' % (
+                  len(entries) - annot_count, annot_count)
 
 
           # ---------- 4. metadata ----------
