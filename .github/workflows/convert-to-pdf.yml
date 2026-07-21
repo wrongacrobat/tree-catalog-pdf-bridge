@@ -997,6 +997,94 @@ jobs:
               return 'no /P element found to promote'
 
 
+          # ---------- 3a. structural parent tree (ISO 32000-1) ----------
+          #
+          # A structure element's /K array is the tree walked top-down for
+          # reading order: page -> card -> "Notable Features". PDF/UA also
+          # requires the reverse map, StructTreeRoot/ParentTree: keyed by each
+          # page's /StructParents integer, an array indexed by MCID pointing
+          # back to the structure element that owns it. Nothing earlier in
+          # this script maintained that map -- splitting a span at a q/Q
+          # boundary mints a brand-new MCID and adds it to a structure
+          # element's /K (fix_marked_content_qQ_nesting), and retiring a
+          # whitespace span removes an MCID from /K (artifact_whitespace_spans),
+          # but neither told ParentTree the array for that page needed to grow
+          # or shrink. The /K side of the tree ends up completely correct --
+          # confirmed by walking it directly, every card's title, "Notable
+          # Features" label, description, dimensions, and growth stats are
+          # all present and in order -- but a reader that resolves content the
+          # OTHER way (page + MCID -> ParentTree -> structure element, which is
+          # how a reading-order view is commonly built) hits a ParentTree array
+          # that's too short and can give up on that page, or on the document,
+          # before it ever gets to displaying the text. Rather than trying to
+          # track every place upstream that mints or retires an MCID, this
+          # rebuilds ParentTree from scratch as the LAST step, straight from
+          # whatever the structure tree and content streams actually contain
+          # by the time every other fix has run -- so it's correct regardless
+          # of which earlier step (or a future one) changed what.
+          def rebuild_parent_tree(pdf):
+              st = pdf.Root.get('/StructTreeRoot')
+              if st is None:
+                  return 'no structure tree, nothing to rebuild'
+
+              owner_by_page_mcid = {}  # (page_objgen, mcid) -> owning struct elem
+
+              def walk(el, cur_page=None):
+                  my_page = el.get('/Pg', cur_page)
+                  for c in struct_children(el):
+                      if isinstance(c, int):
+                          pg = el.get('/Pg', my_page)
+                          if pg is not None:
+                              owner_by_page_mcid[(pg.objgen, c)] = el
+                      elif isinstance(c, pikepdf.Dictionary) and '/S' in c:
+                          walk(c, my_page)
+
+              for k in struct_children(st):
+                  if isinstance(k, pikepdf.Dictionary):
+                      walk(k)
+
+              entries = []
+              for page in pdf.pages:
+                  sp = page.obj.get('/StructParents')
+                  if sp is None:
+                      continue
+                  page_objgen = page.obj.objgen
+                  max_mcid = -1
+                  try:
+                      for inst in pikepdf.parse_content_stream(page):
+                          if str(getattr(inst, 'operator', '')) == 'BDC':
+                              try:
+                                  props = inst.operands[1]
+                                  if isinstance(props, pikepdf.Dictionary) and '/MCID' in props:
+                                      max_mcid = max(max_mcid, int(props.MCID))
+                              except Exception:
+                                  pass
+                  except Exception as exc:
+                      print('  ParentTree rebuild: skipping one page (unparseable '
+                            'content stream): %s' % exc)
+                      continue
+                  if max_mcid < 0:
+                      continue  # page has no tagged content at all: no entry needed
+                  arr = [owner_by_page_mcid.get((page_objgen, i)) for i in range(max_mcid + 1)]
+                  entries.append((int(sp), pdf.make_indirect(pikepdf.Array(arr))))
+
+              entries.sort(key=lambda e: e[0])
+              nums = []
+              for key, arr in entries:
+                  nums.append(key)
+                  nums.append(arr)
+
+              if '/ParentTree' in st:
+                  pt = st['/ParentTree']
+                  pt[Name('/Nums')] = pikepdf.Array(nums)
+                  if '/Kids' in pt:
+                      del pt[Name('/Kids')]
+              else:
+                  st[Name('/ParentTree')] = pdf.make_indirect(Dictionary(Nums=pikepdf.Array(nums)))
+
+              return 'rebuilt for %d page(s)' % len(entries)
+
+
           # ---------- 4. metadata ----------
 
           def fix_metadata(pdf, title):
@@ -1031,6 +1119,7 @@ jobs:
                   print('fix_pdf_pdfua: wrapped %d untagged path objects as artifacts.' % n)
                   print('fix_pdf_pdfua: structure root: %s.' % fix_structure_root(pdf))
                   print('fix_pdf_pdfua: headings: %s.' % ensure_heading(pdf))
+                  print('fix_pdf_pdfua: parent tree: %s.' % rebuild_parent_tree(pdf))
                   fix_metadata(pdf, title)
                   pdf.save(path)
               print('fix_pdf_pdfua: wrote title, XMP, PDF/UA id, and viewer prefs to %s' % path)
